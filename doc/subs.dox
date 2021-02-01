@@ -64,8 +64,8 @@ cannot even be sent. Callbacks work as one would expect, on _rpc_ event they are
 can fail or succeed with optionally generating some output that is sent back to the original sender. There
 can be predicates on the subscription XPath filtering only specific RPC/action instances.
 
-In case there are several subscriptions matching a single RPC/action, it is best to make sure there is only __one__
-subscription with the lowest priority (will be called last). This (main) subscription will be the one generating
+In case there are several subscriptions matching a single RPC/action, there can only be __one__
+subscription with a specific priority. This lowest priority (main) subscription will be the one generating
 output for the sender (previous outputs will be overwritten) and, additionally, will never receive the _abort_
 event (in case it fails, only all the other higher priority callbacks will be aborted).
 
@@ -95,6 +95,13 @@ to read the current state of a device, for example, and then return them as _sta
 they can also be used to provide _configuration_ data nodes. In that case they should return only the
 configuration that is actually in-use by the managed device. Much more details and explanations can be found
 in the [NMDA RFC](@ref rfcs).
+
+When using these [pull operational data](@ref oper_data) subscriptions, the subscription must be **actively handling events**
+whenever **operational datastore data of the module are requested** (so these 2 operations cannot occur in a single thread,
+so they must have individual subscription structures) to **avoid a time out**. Note that operational datastore data are
+required not only when requested explicitly using a getter but also when validating operational datastore (all modules
+or the same module), setting push operational data (for the same module), or sending an RPC/action or a notification
+(if the specific module data are required for validation).
 
 Operational callback is not called unless its data are required so keep these rules in mind:
 

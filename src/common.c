@@ -21,25 +21,25 @@
  */
 #include "common.h"
 
+#include <assert.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <pwd.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <string.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <unistd.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/mman.h>
-#include <signal.h>
-#include <pwd.h>
-#include <grp.h>
-#include <dirent.h>
-#include <inttypes.h>
 #include <time.h>
-#include <assert.h>
-#include <pthread.h>
+#include <unistd.h>
 
 #ifndef SR_HAVE_PTHREAD_MUTEX_TIMEDLOCK
 
@@ -93,15 +93,22 @@ pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *abstime)
 
 sr_error_info_t *
 sr_sub_change_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpath, sr_module_change_cb change_cb,
-        void *private_data, uint32_t priority, sr_subscr_options_t sub_opts, sr_subscription_ctx_t *subs)
+        void *private_data, uint32_t priority, sr_subscr_options_t sub_opts, sr_lock_mode_t has_subs_lock,
+        sr_subscription_ctx_t *subs)
 {
     sr_error_info_t *err_info = NULL;
     struct modsub_change_s *change_sub = NULL;
     uint32_t i;
     void *mem[4] = {NULL};
+    int new_sub = 0;
 
-    /* SUBS LOCK */
-    if ((err_info = sr_mlock(&subs->subs_lock, SR_SUB_EVENT_LOOP_TIMEOUT * 1000, __func__))) {
+    /* just to prevent problems in future changes */
+    assert(has_subs_lock == SR_LOCK_NONE);
+    (void)has_subs_lock;
+
+    /* SUBS WRITE LOCK */
+    if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, sess->conn->cid,
+            __func__, NULL, NULL))) {
         return err_info;
     }
 
@@ -127,13 +134,16 @@ sr_sub_change_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpat
         change_sub->module_name = mem[1];
         change_sub->ds = sess->ds;
 
-        /* create/open shared memory and map it */
-        if ((err_info = sr_shmsub_open_map(mod_name, sr_ds2str(sess->ds), -1, &change_sub->sub_shm, sizeof(sr_multi_sub_shm_t)))) {
+        /* open shared memory and map it */
+        if ((err_info = sr_shmsub_open_map(mod_name, sr_ds2str(sess->ds), -1, &change_sub->sub_shm))) {
             goto error_unlock;
         }
 
         /* make the subscription visible only after everything succeeds */
         ++subs->change_sub_count;
+
+        /* for cleanup */
+        new_sub = 1;
     } else {
         change_sub = &subs->change_subs[i];
     }
@@ -155,15 +165,22 @@ sr_sub_change_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpat
     change_sub->subs[change_sub->sub_count].private_data = private_data;
     change_sub->subs[change_sub->sub_count].sess = sess;
 
+    /* if there is already some event, do not process it (such as timeouted DONE event and this subscription
+     * is DONE-only, it should also never happen that CHANGE event is being processed and we are allowed to subscribe) */
+    change_sub->subs[change_sub->sub_count].request_id = ((sr_multi_sub_shm_t *)change_sub->sub_shm.addr)->request_id;
+    assert(((sr_multi_sub_shm_t *)change_sub->sub_shm.addr)->event != SR_SUB_EV_CHANGE);
+    change_sub->subs[change_sub->sub_count].event = ((sr_multi_sub_shm_t *)change_sub->sub_shm.addr)->event;
+
     ++change_sub->sub_count;
 
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+    /* SUBS WRITE UNLOCK */
+    sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, sess->conn->cid, __func__);
+
     return NULL;
 
 error_unlock:
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+    /* SUBS WRITE UNLOCK */
+    sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, sess->conn->cid, __func__);
 
     for (i = 0; i < 4; ++i) {
         free(mem[i]);
@@ -171,7 +188,7 @@ error_unlock:
     if (change_sub) {
         sr_shm_clear(&change_sub->sub_shm);
     }
-    if (mem[1]) {
+    if (new_sub) {
         --subs->change_sub_count;
     }
     return err_info;
@@ -179,16 +196,29 @@ error_unlock:
 
 void
 sr_sub_change_del(const char *mod_name, const char *xpath, sr_datastore_t ds, sr_module_change_cb change_cb,
-        void *private_data, uint32_t priority, sr_subscr_options_t sub_opts, sr_subscription_ctx_t *subs)
+        void *private_data, uint32_t priority, sr_subscr_options_t sub_opts, sr_lock_mode_t has_subs_lock,
+        sr_subscription_ctx_t *subs)
 {
     sr_error_info_t *err_info = NULL;
     uint32_t i, j;
     struct modsub_change_s *change_sub;
 
-    /* SUBS LOCK */
-    if ((err_info = sr_mlock(&subs->subs_lock, SR_SUB_EVENT_LOOP_TIMEOUT * 1000, __func__))) {
-        sr_errinfo_free(&err_info);
-        return;
+    assert((has_subs_lock == SR_LOCK_READ_UPGR) || (has_subs_lock == SR_LOCK_NONE));
+
+    if (has_subs_lock == SR_LOCK_READ_UPGR) {
+        /* SUBS WRITE LOCK UPGRADE */
+        if ((err_info = sr_rwrelock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, subs->conn->cid, __func__,
+                NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+            has_subs_lock = SR_LOCK_WRITE;
+        }
+    } else {
+        /* SUBS WRITE LOCK */
+        if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, subs->conn->cid, __func__,
+                NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+            has_subs_lock = SR_LOCK_WRITE;
+        }
     }
 
     for (i = 0; i < subs->change_sub_count; ++i) {
@@ -199,12 +229,12 @@ sr_sub_change_del(const char *mod_name, const char *xpath, sr_datastore_t ds, sr
         }
 
         for (j = 0; j < change_sub->sub_count; ++j) {
-            if ((!xpath && change_sub->subs[j].xpath) || (xpath && !change_sub->subs[j].xpath)
-                    || (xpath && change_sub->subs[j].xpath && strcmp(change_sub->subs[j].xpath, xpath))) {
+            if ((!xpath && change_sub->subs[j].xpath) || (xpath && !change_sub->subs[j].xpath) ||
+                    (xpath && change_sub->subs[j].xpath && strcmp(change_sub->subs[j].xpath, xpath))) {
                 continue;
             }
-            if ((change_sub->subs[j].priority != priority) || (change_sub->subs[j].opts != sub_opts)
-                    || (change_sub->subs[j].cb != change_cb) || (change_sub->subs[j].private_data != private_data)) {
+            if ((change_sub->subs[j].priority != priority) || (change_sub->subs[j].opts != sub_opts) ||
+                    (change_sub->subs[j].cb != change_cb) || (change_sub->subs[j].private_data != private_data)) {
                 continue;
             }
 
@@ -232,32 +262,46 @@ sr_sub_change_del(const char *mod_name, const char *xpath, sr_datastore_t ds, sr
                 }
             }
 
-            /* SUBS UNLOCK */
-            sr_munlock(&subs->subs_lock);
-            return;
+            /* success */
+            goto cleanup;
         }
     }
 
     /* unreachable */
     assert(0);
 
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+cleanup:
+    if (has_subs_lock == SR_LOCK_READ_UPGR) {
+        /* SUBS READ UPGR LOCK DOWNGRADE */
+        if ((err_info = sr_rwrelock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_READ_UPGR, subs->conn->cid,
+                __func__, NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+        }
+    } else if (has_subs_lock == SR_LOCK_NONE) {
+        /* SUBS WRITE UNLOCK */
+        sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, subs->conn->cid, __func__);
+    }
 }
 
 sr_error_info_t *
 sr_sub_oper_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpath, sr_oper_get_items_cb oper_cb,
-        void *private_data, sr_subscription_ctx_t *subs)
+        void *private_data, sr_lock_mode_t has_subs_lock, sr_subscription_ctx_t *subs)
 {
     sr_error_info_t *err_info = NULL;
     struct modsub_oper_s *oper_sub = NULL;
     uint32_t i;
     void *mem[4] = {NULL};
+    int new_sub = 0;
 
     assert(mod_name && xpath);
 
-    /* SUBS LOCK */
-    if ((err_info = sr_mlock(&subs->subs_lock, SR_SUB_EVENT_LOOP_TIMEOUT * 1000, __func__))) {
+    /* just to prevent problems in future changes */
+    assert(has_subs_lock == SR_LOCK_NONE);
+    (void)has_subs_lock;
+
+    /* SUBS WRITE LOCK */
+    if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, sess->conn->cid,
+            __func__, NULL, NULL))) {
         return err_info;
     }
 
@@ -283,6 +327,9 @@ sr_sub_oper_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpath,
 
         /* make the subscription visible only after everything succeeds */
         ++subs->oper_sub_count;
+
+        /* for cleanup */
+        new_sub = 1;
     } else {
         oper_sub = &subs->oper_subs[i];
     }
@@ -302,42 +349,54 @@ sr_sub_oper_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpath,
     oper_sub->subs[oper_sub->sub_count].private_data = private_data;
     oper_sub->subs[oper_sub->sub_count].sess = sess;
 
-    /* create specific SHM and map it */
-    if ((err_info = sr_shmsub_open_map(mod_name, "oper", sr_str_hash(xpath), &oper_sub->subs[oper_sub->sub_count].sub_shm,
-            sizeof(sr_sub_shm_t)))) {
+    /* open sub SHM and map it */
+    if ((err_info = sr_shmsub_open_map(mod_name, "oper", sr_str_hash(xpath), &oper_sub->subs[oper_sub->sub_count].sub_shm))) {
         goto error_unlock;
     }
 
     ++oper_sub->sub_count;
 
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+    /* SUBS WRITE UNLOCK */
+    sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, sess->conn->cid, __func__);
+
     return NULL;
 
 error_unlock:
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+    /* SUBS WRITE UNLOCK */
+    sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, sess->conn->cid, __func__);
 
     for (i = 0; i < 4; ++i) {
         free(mem[i]);
     }
-    if (mem[1]) {
+    if (new_sub) {
         --subs->oper_sub_count;
     }
     return err_info;
 }
 
 void
-sr_sub_oper_del(const char *mod_name, const char *xpath, sr_subscription_ctx_t *subs)
+sr_sub_oper_del(const char *mod_name, const char *xpath, sr_lock_mode_t has_subs_lock, sr_subscription_ctx_t *subs)
 {
     sr_error_info_t *err_info = NULL;
     uint32_t i, j;
     struct modsub_oper_s *oper_sub;
 
-    /* SUBS LOCK */
-    if ((err_info = sr_mlock(&subs->subs_lock, SR_SUB_EVENT_LOOP_TIMEOUT * 1000, __func__))) {
-        sr_errinfo_free(&err_info);
-        return;
+    assert((has_subs_lock == SR_LOCK_READ_UPGR) || (has_subs_lock == SR_LOCK_NONE));
+
+    if (has_subs_lock == SR_LOCK_READ_UPGR) {
+        /* SUBS WRITE LOCK UPGRADE */
+        if ((err_info = sr_rwrelock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, subs->conn->cid, __func__,
+                NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+            has_subs_lock = SR_LOCK_WRITE;
+        }
+    } else {
+        /* SUBS WRITE LOCK */
+        if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, subs->conn->cid, __func__,
+                NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+            has_subs_lock = SR_LOCK_WRITE;
+        }
     }
 
     for (i = 0; i < subs->oper_sub_count; ++i) {
@@ -376,32 +435,47 @@ sr_sub_oper_del(const char *mod_name, const char *xpath, sr_subscription_ctx_t *
                 }
             }
 
-            /* SUBS UNLOCK */
-            sr_munlock(&subs->subs_lock);
-            return;
+            /* success */
+            goto cleanup;
         }
     }
 
     /* unreachable */
     assert(0);
 
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+cleanup:
+    if (has_subs_lock == SR_LOCK_READ_UPGR) {
+        /* SUBS READ UPGR LOCK DOWNGRADE */
+        if ((err_info = sr_rwrelock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_READ_UPGR, subs->conn->cid,
+                __func__, NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+        }
+    } else if (has_subs_lock == SR_LOCK_NONE) {
+        /* SUBS WRITE UNLOCK */
+        sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, subs->conn->cid, __func__);
+    }
 }
 
 sr_error_info_t *
-sr_sub_notif_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpath, time_t start_time, time_t stop_time,
-        sr_event_notif_cb notif_cb, sr_event_notif_tree_cb notif_tree_cb, void *private_data, sr_subscription_ctx_t *subs)
+sr_sub_notif_add(sr_session_ctx_t *sess, const char *mod_name, uint32_t sub_id, const char *xpath, time_t start_time,
+        time_t stop_time, sr_event_notif_cb notif_cb, sr_event_notif_tree_cb notif_tree_cb, void *private_data,
+        sr_lock_mode_t has_subs_lock, sr_subscription_ctx_t *subs)
 {
     sr_error_info_t *err_info = NULL;
     struct modsub_notif_s *notif_sub = NULL;
     uint32_t i;
     void *mem[4] = {NULL};
+    int new_sub = 0;
 
     assert(mod_name);
 
-    /* SUBS LOCK */
-    if ((err_info = sr_mlock(&subs->subs_lock, SR_SUB_EVENT_LOOP_TIMEOUT * 1000, __func__))) {
+    /* just to prevent problems in future changes */
+    assert(has_subs_lock == SR_LOCK_NONE);
+    (void)has_subs_lock;
+
+    /* SUBS WRITE LOCK */
+    if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, sess->conn->cid,
+            __func__, NULL, NULL))) {
         return err_info;
     }
 
@@ -426,13 +500,16 @@ sr_sub_notif_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpath
         SR_CHECK_MEM_GOTO(!mem[1], err_info, error_unlock);
         notif_sub->module_name = mem[1];
 
-        /* create specific SHM and map it */
-        if ((err_info = sr_shmsub_open_map(mod_name, "notif", -1, &notif_sub->sub_shm, sizeof(sr_sub_shm_t)))) {
+        /* open specific SHM and map it */
+        if ((err_info = sr_shmsub_open_map(mod_name, "notif", -1, &notif_sub->sub_shm))) {
             goto error_unlock;
         }
 
         /* make the subscription visible only after everything succeeds */
         ++subs->notif_sub_count;
+
+        /* for cleanup */
+        new_sub = 1;
     } else {
         notif_sub = &subs->notif_subs[i];
     }
@@ -444,6 +521,7 @@ sr_sub_notif_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpath
     memset(notif_sub->subs + notif_sub->sub_count, 0, sizeof *notif_sub->subs);
 
     /* set attributes */
+    notif_sub->subs[notif_sub->sub_count].sub_id = sub_id;
     if (xpath) {
         mem[3] = strdup(xpath);
         SR_CHECK_MEM_GOTO(!mem[3], err_info, error_unlock);
@@ -458,18 +536,19 @@ sr_sub_notif_add(sr_session_ctx_t *sess, const char *mod_name, const char *xpath
 
     ++notif_sub->sub_count;
 
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+    /* SUBS WRITE UNLOCK */
+    sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, sess->conn->cid, __func__);
+
     return NULL;
 
 error_unlock:
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+    /* SUBS WRITE UNLOCK */
+    sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, sess->conn->cid, __func__);
 
     for (i = 0; i < 4; ++i) {
         free(mem[i]);
     }
-    if (mem[1]) {
+    if (new_sub) {
         --subs->notif_sub_count;
         sr_shm_clear(&notif_sub->sub_shm);
     }
@@ -477,18 +556,27 @@ error_unlock:
 }
 
 void
-sr_sub_notif_del(const char *mod_name, const char *xpath, time_t start_time, time_t stop_time, sr_event_notif_cb notif_cb,
-        sr_event_notif_tree_cb notif_tree_cb, void *private_data, sr_subscription_ctx_t *subs, int has_subs_lock)
+sr_sub_notif_del(const char *mod_name, uint32_t sub_id, sr_lock_mode_t has_subs_lock, sr_subscription_ctx_t *subs)
 {
     sr_error_info_t *err_info = NULL;
     uint32_t i, j;
     struct modsub_notif_s *notif_sub;
 
-    if (!has_subs_lock) {
-        /* SUBS LOCK */
-        if ((err_info = sr_mlock(&subs->subs_lock, SR_SUB_EVENT_LOOP_TIMEOUT * 1000, __func__))) {
+    assert((has_subs_lock == SR_LOCK_WRITE) || (has_subs_lock == SR_LOCK_READ_UPGR) || (has_subs_lock == SR_LOCK_NONE));
+
+    if (has_subs_lock == SR_LOCK_READ_UPGR) {
+        /* SUBS WRITE LOCK UPGRADE */
+        if ((err_info = sr_rwrelock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, subs->conn->cid, __func__,
+                NULL, NULL))) {
             sr_errinfo_free(&err_info);
-            return;
+            has_subs_lock = SR_LOCK_WRITE;
+        }
+    } else if (has_subs_lock == SR_LOCK_NONE) {
+        /* SUBS WRITE LOCK */
+        if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, subs->conn->cid, __func__,
+                NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+            has_subs_lock = SR_LOCK_WRITE;
         }
     }
 
@@ -500,13 +588,7 @@ sr_sub_notif_del(const char *mod_name, const char *xpath, time_t start_time, tim
         }
 
         for (j = 0; j < notif_sub->sub_count; ++j) {
-            if ((!xpath && notif_sub->subs[j].xpath) || (xpath && (!notif_sub->subs[j].xpath
-                    || strcmp(notif_sub->subs[j].xpath, xpath)))) {
-                continue;
-            }
-            if ((start_time != notif_sub->subs[j].start_time) || (stop_time != notif_sub->subs[j].stop_time)
-                    || (notif_cb != notif_sub->subs[j].cb) || (notif_tree_cb != notif_sub->subs[j].tree_cb)
-                    || (private_data != notif_sub->subs[j].private_data)) {
+            if (sub_id != notif_sub->subs[j].sub_id) {
                 continue;
             }
 
@@ -534,43 +616,53 @@ sr_sub_notif_del(const char *mod_name, const char *xpath, time_t start_time, tim
                 }
             }
 
-            if (!has_subs_lock) {
-                /* SUBS UNLOCK */
-                sr_munlock(&subs->subs_lock);
-            }
-            return;
+            /* success */
+            goto cleanup;
         }
     }
 
     /* unreachable */
     assert(0);
 
-    if (!has_subs_lock) {
-        /* SUBS UNLOCK */
-        sr_munlock(&subs->subs_lock);
+cleanup:
+    if (has_subs_lock == SR_LOCK_READ_UPGR) {
+        /* SUBS READ UPGR LOCK DOWNGRADE */
+        if ((err_info = sr_rwrelock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_READ_UPGR, subs->conn->cid,
+                __func__, NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+        }
+    } else if (has_subs_lock == SR_LOCK_NONE) {
+        /* SUBS WRITE UNLOCK */
+        sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, subs->conn->cid, __func__);
     }
 }
 
 sr_error_info_t *
-sr_sub_rpc_add(sr_session_ctx_t *sess, const char *op_path, const char *xpath, sr_rpc_cb rpc_cb,
-        sr_rpc_tree_cb rpc_tree_cb, void *private_data, uint32_t priority, sr_subscription_ctx_t *subs)
+sr_sub_rpc_add(sr_session_ctx_t *sess, const char *path, const char *xpath, sr_rpc_cb rpc_cb, sr_rpc_tree_cb rpc_tree_cb,
+        void *private_data, uint32_t priority, sr_lock_mode_t has_subs_lock, sr_subscription_ctx_t *subs)
 {
     sr_error_info_t *err_info = NULL;
     struct opsub_rpc_s *rpc_sub = NULL;
     uint32_t i;
     char *mod_name;
     void *mem[4] = {NULL};
+    int new_sub = 0;
 
-    assert(op_path && xpath && (rpc_cb || rpc_tree_cb) && (!rpc_cb || !rpc_tree_cb));
+    assert(path && xpath && (rpc_cb || rpc_tree_cb) && (!rpc_cb || !rpc_tree_cb));
 
-    /* SUBS LOCK */
-    if ((err_info = sr_mlock(&subs->subs_lock, SR_SUB_EVENT_LOOP_TIMEOUT * 1000, __func__))) {
+    /* just to prevent problems in future changes */
+    assert(has_subs_lock == SR_LOCK_NONE);
+    (void)has_subs_lock;
+
+    /* SUBS WRITE LOCK */
+    if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, sess->conn->cid,
+            __func__, NULL, NULL))) {
         return err_info;
     }
 
     /* try to find this RPC/action subscriptions, they may already exist */
     for (i = 0; i < subs->rpc_sub_count; ++i) {
-        if (!strcmp(op_path, subs->rpc_subs[i].op_path)) {
+        if (!strcmp(path, subs->rpc_subs[i].path)) {
             break;
         }
     }
@@ -585,15 +677,15 @@ sr_sub_rpc_add(sr_session_ctx_t *sess, const char *op_path, const char *xpath, s
         rpc_sub->sub_shm.fd = -1;
 
         /* set attributes */
-        mem[1] = strdup(op_path);
+        mem[1] = strdup(path);
         SR_CHECK_MEM_GOTO(!mem[1], err_info, error_unlock);
-        rpc_sub->op_path = mem[1];
+        rpc_sub->path = mem[1];
 
         /* get module name */
         mod_name = sr_get_first_ns(xpath);
 
-        /* create specific SHM and map it */
-        err_info = sr_shmsub_open_map(mod_name, "rpc", sr_str_hash(op_path), &rpc_sub->sub_shm, sizeof(sr_multi_sub_shm_t));
+        /* open specific SHM and map it */
+        err_info = sr_shmsub_open_map(mod_name, "rpc", sr_str_hash(path), &rpc_sub->sub_shm);
         free(mod_name);
         if (err_info) {
             goto error_unlock;
@@ -601,6 +693,9 @@ sr_sub_rpc_add(sr_session_ctx_t *sess, const char *op_path, const char *xpath, s
 
         /* make the subscription visible only after everything succeeds */
         ++subs->rpc_sub_count;
+
+        /* for cleanup */
+        new_sub = 1;
     } else {
         rpc_sub = &subs->rpc_subs[i];
     }
@@ -623,18 +718,19 @@ sr_sub_rpc_add(sr_session_ctx_t *sess, const char *op_path, const char *xpath, s
 
     ++rpc_sub->sub_count;
 
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+    /* SUBS WRITE UNLOCK */
+    sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, sess->conn->cid, __func__);
+
     return NULL;
 
 error_unlock:
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+    /* SUBS WRITE UNLOCK */
+    sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, sess->conn->cid, __func__);
 
     for (i = 0; i < 4; ++i) {
         free(mem[i]);
     }
-    if (mem[1]) {
+    if (new_sub) {
         --subs->rpc_sub_count;
         sr_shm_clear(&rpc_sub->sub_shm);
     }
@@ -642,23 +738,35 @@ error_unlock:
 }
 
 void
-sr_sub_rpc_del(const char *op_path, const char *xpath, sr_rpc_cb rpc_cb, sr_rpc_tree_cb rpc_tree_cb, void *private_data,
-        uint32_t priority, sr_subscription_ctx_t *subs)
+sr_sub_rpc_del(const char *path, const char *xpath, sr_rpc_cb rpc_cb, sr_rpc_tree_cb rpc_tree_cb, void *private_data,
+        uint32_t priority, sr_lock_mode_t has_subs_lock, sr_subscription_ctx_t *subs)
 {
     sr_error_info_t *err_info = NULL;
     uint32_t i, j;
     struct opsub_rpc_s *rpc_sub;
 
-    /* SUBS LOCK */
-    if ((err_info = sr_mlock(&subs->subs_lock, SR_SUB_EVENT_LOOP_TIMEOUT * 1000, __func__))) {
-        sr_errinfo_free(&err_info);
-        return;
+    assert((has_subs_lock == SR_LOCK_READ_UPGR) || (has_subs_lock == SR_LOCK_WRITE));
+
+    if (has_subs_lock == SR_LOCK_READ_UPGR) {
+        /* SUBS WRITE LOCK UPGRADE */
+        if ((err_info = sr_rwrelock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, subs->conn->cid,
+                __func__, NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+            has_subs_lock = SR_LOCK_WRITE;
+        }
+    } else {
+        /* SUBS WRITE LOCK */
+        if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_WRITE, subs->conn->cid, __func__,
+                NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+            has_subs_lock = SR_LOCK_WRITE;
+        }
     }
 
     for (i = 0; i < subs->rpc_sub_count; ++i) {
         rpc_sub = &subs->rpc_subs[i];
 
-        if (strcmp(op_path, rpc_sub->op_path)) {
+        if (strcmp(path, rpc_sub->path)) {
             continue;
         }
 
@@ -666,8 +774,8 @@ sr_sub_rpc_del(const char *op_path, const char *xpath, sr_rpc_cb rpc_cb, sr_rpc_
             if (strcmp(rpc_sub->subs[j].xpath, xpath) || (rpc_sub->subs[j].priority != priority)) {
                 continue;
             }
-            if ((rpc_sub->subs[j].cb != rpc_cb) || (rpc_sub->subs[j].tree_cb != rpc_tree_cb)
-                        || (rpc_sub->subs[j].private_data != private_data)) {
+            if ((rpc_sub->subs[j].cb != rpc_cb) || (rpc_sub->subs[j].tree_cb != rpc_tree_cb) ||
+                    (rpc_sub->subs[j].private_data != private_data)) {
                 continue;
             }
 
@@ -680,7 +788,7 @@ sr_sub_rpc_del(const char *op_path, const char *xpath, sr_rpc_cb rpc_cb, sr_rpc_
 
             if (!rpc_sub->sub_count) {
                 /* no other subscriptions for this RPC/action, replace it with the last */
-                free(rpc_sub->op_path);
+                free(rpc_sub->path);
                 sr_shm_clear(&rpc_sub->sub_shm);
                 free(rpc_sub->subs);
                 if (i < subs->rpc_sub_count - 1) {
@@ -695,27 +803,39 @@ sr_sub_rpc_del(const char *op_path, const char *xpath, sr_rpc_cb rpc_cb, sr_rpc_
                 }
             }
 
-            /* SUBS UNLOCK */
-            sr_munlock(&subs->subs_lock);
-            return;
+            /* success */
+            goto cleanup;
         }
     }
 
     /* unreachable */
     assert(0);
 
-    /* SUBS UNLOCK */
-    sr_munlock(&subs->subs_lock);
+cleanup:
+    if (has_subs_lock == SR_LOCK_READ_UPGR) {
+        /* SUBS READ UPGR LOCK DOWNGRADE */
+        if ((err_info = sr_rwrelock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_READ_UPGR, subs->conn->cid,
+                __func__, NULL, NULL))) {
+            sr_errinfo_free(&err_info);
+        }
+    } else if (has_subs_lock == SR_LOCK_NONE) {
+        /* SUBS WRITE UNLOCK */
+        sr_rwunlock(&subs->subs_lock, 0, SR_LOCK_WRITE, subs->conn->cid, __func__);
+    }
 }
 
 int
-sr_subs_session_count(sr_session_ctx_t *sess, sr_subscription_ctx_t *subs)
+sr_subs_session_count(sr_session_ctx_t *sess, sr_lock_mode_t has_subs_lock, sr_subscription_ctx_t *subs)
 {
     uint32_t count = 0, i, j;
     struct modsub_change_s *change_subs;
     struct modsub_oper_s *oper_subs;
     struct modsub_notif_s *notif_sub;
     struct opsub_rpc_s *rpc_sub;
+
+    /* we are only reading so any lock is fine */
+    assert(has_subs_lock != SR_LOCK_NONE);
+    (void)has_subs_lock;
 
     /* change subscriptions */
     for (i = 0; i < subs->change_sub_count; ++i) {
@@ -761,129 +881,173 @@ sr_subs_session_count(sr_session_ctx_t *sess, sr_subscription_ctx_t *subs)
 }
 
 sr_error_info_t *
-sr_subs_session_del(sr_session_ctx_t *sess, sr_subscription_ctx_t *subs)
+sr_subs_session_del(sr_session_ctx_t *sess, sr_lock_mode_t has_subs_lock, sr_subscription_ctx_t *subs)
 {
     sr_error_info_t *err_info = NULL;
     uint32_t i, j;
     struct modsub_change_s *change_subs;
-    struct modsub_oper_s *oper_sub;
-    struct modsub_notif_s *notif_sub;
-    struct opsub_rpc_s *rpc_sub;
+    struct modsub_oper_s *oper_subs;
+    struct modsub_notif_s *notif_subs;
+    struct opsub_rpc_s *rpc_subs;
     sr_mod_t *shm_mod;
     sr_rpc_t *shm_rpc;
-    sr_shm_t *ext_shm;
+    int del;
 
-    ext_shm = &sess->conn->ext_shm;
+    assert((has_subs_lock == SR_LOCK_READ_UPGR) || (has_subs_lock == SR_LOCK_NONE));
 
-    /* remove ourselves from session subscriptions */
-    if ((err_info = sr_ptr_del(&sess->ptr_lock, (void ***)&sess->subscriptions, &sess->subscription_count, subs))) {
-        return err_info;
+    if (has_subs_lock == SR_LOCK_NONE) {
+        /* SUBS READ UPGR LOCK */
+        if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_READ_UPGR, sess->conn->cid,
+                __func__, NULL, NULL))) {
+            return err_info;
+        }
     }
 
-change_subs_del:
+    /* remove ourselves from session subscriptions (needs SUBS lock to avoid removing it twice in case of reaching
+     * a notification stop time) */
+    if ((err_info = sr_ptr_del(&sess->ptr_lock, (void ***)&sess->subscriptions, &sess->subscription_count, subs))) {
+        goto cleanup_subs_unlock;
+    }
+
     /* change subscriptions */
-    for (i = 0; i < subs->change_sub_count; ++i) {
+    i = 0;
+    while (i < subs->change_sub_count) {
         change_subs = &subs->change_subs[i];
 
         /* find module */
-        shm_mod = sr_shmmain_find_module(&sess->conn->main_shm, ext_shm->addr, change_subs->module_name, 0);
-        SR_CHECK_INT_RET(!shm_mod, err_info);
+        shm_mod = sr_shmmain_find_module(SR_CONN_MAIN_SHM(sess->conn), change_subs->module_name);
+        SR_CHECK_INT_GOTO(!shm_mod, err_info, cleanup_subs_unlock);
+
+        del = 0;
         for (j = 0; j < change_subs->sub_count; ++j) {
             if (change_subs->subs[j].sess == sess) {
                 /* properly remove the subscription from ext SHM */
-                if ((err_info = sr_shmmod_change_subscription_stop(sess->conn, shm_mod, change_subs->subs[j].xpath,
-                        change_subs->ds, change_subs->subs[j].priority, change_subs->subs[j].opts, subs->evpipe_num, 0))) {
-                    return err_info;
+                if ((err_info = sr_shmext_change_subscription_del(sess->conn, shm_mod, change_subs->ds,
+                        change_subs->subs[j].xpath, change_subs->subs[j].priority, change_subs->subs[j].opts,
+                        subs->evpipe_num))) {
+                    goto cleanup_subs_unlock;
                 }
 
                 /* remove the subscription from the subscription structure */
-                sr_sub_change_del(change_subs->module_name, change_subs->subs[j].xpath, change_subs->ds, change_subs->subs[j].cb,
-                        change_subs->subs[j].private_data, change_subs->subs[j].priority, change_subs->subs[j].opts, subs);
+                sr_sub_change_del(change_subs->module_name, change_subs->subs[j].xpath, change_subs->ds,
+                        change_subs->subs[j].cb, change_subs->subs[j].private_data, change_subs->subs[j].priority,
+                        change_subs->subs[j].opts, SR_LOCK_READ_UPGR, subs);
 
-                /* restart loops */
-                goto change_subs_del;
+                del = 1;
+                break;
             }
+        }
+
+        /* next iter */
+        if (!del) {
+            ++i;
         }
     }
 
-oper_subs_del:
     /* operational subscriptions */
-    for (i = 0; i < subs->oper_sub_count; ++i) {
-        oper_sub = &subs->oper_subs[i];
+    i = 0;
+    while (i < subs->oper_sub_count) {
+        oper_subs = &subs->oper_subs[i];
 
         /* find module */
-        shm_mod = sr_shmmain_find_module(&sess->conn->main_shm, ext_shm->addr, oper_sub->module_name, 0);
-        SR_CHECK_INT_RET(!shm_mod, err_info);
-        for (j = 0; j < oper_sub->sub_count; ++j) {
-            if (oper_sub->subs[j].sess == sess) {
+        shm_mod = sr_shmmain_find_module(SR_CONN_MAIN_SHM(sess->conn), oper_subs->module_name);
+        SR_CHECK_INT_GOTO(!shm_mod, err_info, cleanup_subs_unlock);
+
+        del = 0;
+        for (j = 0; j < oper_subs->sub_count; ++j) {
+            if (oper_subs->subs[j].sess == sess) {
                 /* properly remove the subscriptions from the main SHM */
-                if ((err_info = sr_shmmod_oper_subscription_stop(ext_shm->addr, shm_mod, oper_sub->subs[j].xpath,
-                        subs->evpipe_num, 0))) {
-                    return err_info;
+                if ((err_info = sr_shmext_oper_subscription_del(sess->conn, shm_mod, oper_subs->subs[j].xpath,
+                        subs->evpipe_num))) {
+                    goto cleanup_subs_unlock;
                 }
 
                 /* remove the subscription from the subscription structure */
-                sr_sub_oper_del(oper_sub->module_name, oper_sub->subs[j].xpath, subs);
+                sr_sub_oper_del(oper_subs->module_name, oper_subs->subs[j].xpath, SR_LOCK_READ_UPGR, subs);
 
-                /* restart loops */
-                goto oper_subs_del;
+                del = 1;
+                break;
             }
+        }
+
+        /* next iter */
+        if (!del) {
+            ++i;
         }
     }
 
-notif_subs_del:
     /* notification subscriptions */
-    for (i = 0; i < subs->notif_sub_count; ++i) {
-        notif_sub = &subs->notif_subs[i];
+    i = 0;
+    while (i < subs->notif_sub_count) {
+        notif_subs = &subs->notif_subs[i];
 
         /* find module */
-        shm_mod = sr_shmmain_find_module(&sess->conn->main_shm, ext_shm->addr, notif_sub->module_name, 0);
-        SR_CHECK_INT_RET(!shm_mod, err_info);
-        for (j = 0; j < notif_sub->sub_count; ++j) {
-            if (notif_sub->subs[j].sess == sess) {
+        shm_mod = sr_shmmain_find_module(SR_CONN_MAIN_SHM(sess->conn), notif_subs->module_name);
+        SR_CHECK_INT_GOTO(!shm_mod, err_info, cleanup_subs_unlock);
+
+        del = 0;
+        for (j = 0; j < notif_subs->sub_count; ++j) {
+            if (notif_subs->subs[j].sess == sess) {
                 /* properly remove the subscriptions from the main SHM */
-                if ((err_info = sr_shmmod_notif_subscription_stop(ext_shm->addr, shm_mod, subs->evpipe_num, 0))) {
-                    return err_info;
+                if ((err_info = sr_shmext_notif_subscription_del(sess->conn, shm_mod, notif_subs->subs[j].sub_id,
+                        subs->evpipe_num))) {
+                    goto cleanup_subs_unlock;
                 }
 
                 /* remove the subscription from the subscription structure */
-                sr_sub_notif_del(notif_sub->module_name, notif_sub->subs[j].xpath, notif_sub->subs[j].start_time,
-                        notif_sub->subs[j].stop_time, notif_sub->subs[j].cb, notif_sub->subs[j].tree_cb,
-                        notif_sub->subs[j].private_data, subs, 0);
+                sr_sub_notif_del(notif_subs->module_name, notif_subs->subs[j].sub_id, SR_LOCK_READ_UPGR, subs);
 
-                /* restart loops */
-                goto notif_subs_del;
+                del = 1;
+                break;
             }
+        }
+
+        /* next iter */
+        if (!del) {
+            ++i;
         }
     }
 
-rpc_subs_del:
     /* RPC/action subscriptions */
-    for (i = 0; i < subs->rpc_sub_count; ++i) {
-        rpc_sub = &subs->rpc_subs[i];
+    i = 0;
+    while (i < subs->rpc_sub_count) {
+        rpc_subs = &subs->rpc_subs[i];
 
         /* find RPC/action */
-        shm_rpc = sr_shmmain_find_rpc((sr_main_shm_t *)sess->conn->main_shm.addr, ext_shm->addr, rpc_sub->op_path, 0);
-        SR_CHECK_INT_RET(!shm_rpc, err_info);
-        for (j = 0; j < rpc_sub->sub_count; ++j) {
-            if (rpc_sub->subs[j].sess == sess) {
+        shm_rpc = sr_shmmain_find_rpc(SR_CONN_MAIN_SHM(sess->conn), rpc_subs->path);
+        SR_CHECK_INT_GOTO(!shm_rpc, err_info, cleanup_subs_unlock);
+
+        del = 0;
+        for (j = 0; j < rpc_subs->sub_count; ++j) {
+            if (rpc_subs->subs[j].sess == sess) {
                 /* properly remove the subscription from the main SHM */
-                if ((err_info = sr_shmmain_rpc_subscription_stop(sess->conn, shm_rpc, rpc_sub->subs[j].xpath,
-                        rpc_sub->subs[j].priority, subs->evpipe_num, 0, NULL))) {
-                    return err_info;
+                if ((err_info = sr_shmext_rpc_subscription_del(sess->conn, shm_rpc, rpc_subs->subs[j].xpath,
+                        rpc_subs->subs[j].priority, subs->evpipe_num))) {
+                    goto cleanup_subs_unlock;
                 }
 
                 /* remove the subscription from the subscription structure */
-                sr_sub_rpc_del(rpc_sub->op_path, rpc_sub->subs[j].xpath, rpc_sub->subs[j].cb, rpc_sub->subs[j].tree_cb,
-                        rpc_sub->subs[j].private_data, rpc_sub->subs[j].priority, subs);
+                sr_sub_rpc_del(rpc_subs->path, rpc_subs->subs[j].xpath, rpc_subs->subs[j].cb, rpc_subs->subs[j].tree_cb,
+                        rpc_subs->subs[j].private_data, rpc_subs->subs[j].priority, SR_LOCK_READ_UPGR, subs);
 
-                /* restart loops */
-                goto rpc_subs_del;
+                del = 1;
+                break;
             }
+        }
+
+        /* next iter */
+        if (!del) {
+            ++i;
         }
     }
 
-    return NULL;
+cleanup_subs_unlock:
+    if (has_subs_lock == SR_LOCK_NONE) {
+        /* SUBS READ UPGR UNLOCK */
+        sr_rwunlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_READ_UPGR, sess->conn->cid, __func__);
+    }
+
+    return err_info;
 }
 
 sr_error_info_t *
@@ -896,14 +1060,20 @@ sr_subs_del_all(sr_subscription_ctx_t *subs)
     struct modsub_notif_s *notif_sub;
     struct opsub_rpc_s *rpc_sub;
 
+    /* SUBS READ UPGR LOCK */
+    if ((err_info = sr_rwlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_READ_UPGR, subs->conn->cid,
+            __func__, NULL, NULL))) {
+        return err_info;
+    }
+
 subs_del:
     /* change subscriptions */
     for (i = 0; i < subs->change_sub_count; ++i) {
         change_subs = &subs->change_subs[i];
         for (j = 0; j < change_subs->sub_count; ++j) {
             /* remove all subscriptions in subs from the session */
-            if ((err_info = sr_subs_session_del(change_subs->subs[j].sess, subs))) {
-                return err_info;
+            if ((err_info = sr_subs_session_del(change_subs->subs[j].sess, SR_LOCK_READ_UPGR, subs))) {
+                goto cleanup;
             }
             goto subs_del;
         }
@@ -914,8 +1084,8 @@ subs_del:
         oper_subs = &subs->oper_subs[i];
         for (j = 0; j < oper_subs->sub_count; ++j) {
             /* remove all subscriptions in subs from the session */
-            if ((err_info = sr_subs_session_del(oper_subs->subs[j].sess, subs))) {
-                return err_info;
+            if ((err_info = sr_subs_session_del(oper_subs->subs[j].sess, SR_LOCK_READ_UPGR, subs))) {
+                goto cleanup;
             }
             goto subs_del;
         }
@@ -926,8 +1096,8 @@ subs_del:
         notif_sub = &subs->notif_subs[i];
         for (j = 0; j < notif_sub->sub_count; ++j) {
             /* remove all subscriptions in subs from the session */
-            if ((err_info = sr_subs_session_del(notif_sub->subs[j].sess, subs))) {
-                return err_info;
+            if ((err_info = sr_subs_session_del(notif_sub->subs[j].sess, SR_LOCK_READ_UPGR, subs))) {
+                goto cleanup;
             }
             goto subs_del;
         }
@@ -938,27 +1108,53 @@ subs_del:
         rpc_sub = &subs->rpc_subs[i];
         for (j = 0; j < rpc_sub->sub_count; ++j) {
             /* remove all subscriptions in subs from the session */
-            if ((err_info = sr_subs_session_del(rpc_sub->subs[i].sess, subs))) {
-                return err_info;
+            if ((err_info = sr_subs_session_del(rpc_sub->subs[i].sess, SR_LOCK_READ_UPGR, subs))) {
+                goto cleanup;
             }
             goto subs_del;
         }
     }
 
-    return NULL;
+cleanup:
+    /* SUBS READ UPGR UNLOCK */
+    sr_rwunlock(&subs->subs_lock, SR_SUBSCR_LOCK_TIMEOUT, SR_LOCK_READ_UPGR, subs->conn->cid, __func__);
+
+    return err_info;
 }
 
 sr_error_info_t *
-sr_notif_find_subscriber(sr_conn_ctx_t *conn, const char *mod_name, sr_mod_notif_sub_t **notif_subs, uint32_t *notif_sub_count)
+sr_notif_find_subscriber(sr_conn_ctx_t *conn, const char *mod_name, sr_mod_notif_sub_t **notif_subs,
+        uint32_t *notif_sub_count)
 {
     sr_error_info_t *err_info = NULL;
     sr_mod_t *shm_mod;
+    uint32_t i;
 
-    shm_mod = sr_shmmain_find_module(&conn->main_shm, conn->ext_shm.addr, mod_name, 0);
+    shm_mod = sr_shmmain_find_module(SR_CONN_MAIN_SHM(conn), mod_name);
     SR_CHECK_INT_RET(!shm_mod, err_info);
 
     *notif_subs = (sr_mod_notif_sub_t *)(conn->ext_shm.addr + shm_mod->notif_subs);
-    *notif_sub_count = shm_mod->notif_sub_count;
+
+    /* do not count suspended subscribers */
+    *notif_sub_count = 0;
+    i = 0;
+    while (i < shm_mod->notif_sub_count) {
+        /* check subscription aliveness */
+        if (!sr_conn_is_alive((*notif_subs)[i].cid)) {
+            /* recover the subscription */
+            if ((err_info = sr_shmext_notif_subscription_stop(conn, shm_mod, i, 1, SR_LOCK_READ, 1))) {
+                sr_errinfo_free(&err_info);
+            }
+            continue;
+        }
+
+        if (!ATOMIC_LOAD_RELAXED((*notif_subs)[i].suspended)) {
+            ++(*notif_sub_count);
+        }
+
+        ++i;
+    }
+
     return NULL;
 }
 
@@ -1036,7 +1232,7 @@ sr_ptr_add(pthread_mutex_t *ptr_lock, void ***ptrs, uint32_t *ptr_count, void *a
     void *mem;
 
     /* PTR LOCK */
-    if ((err_info = sr_mlock(ptr_lock, -1, __func__))) {
+    if ((err_info = sr_mlock(ptr_lock, -1, __func__, NULL, NULL))) {
         return err_info;
     }
 
@@ -1076,7 +1272,7 @@ sr_ptr_del(pthread_mutex_t *ptr_lock, void ***ptrs, uint32_t *ptr_count, void *d
     int found = 0;
 
     /* PTR LOCK */
-    if ((err_info = sr_mlock(ptr_lock, -1, __func__))) {
+    if ((err_info = sr_mlock(ptr_lock, -1, __func__, NULL, NULL))) {
         return err_info;
     }
 
@@ -1274,26 +1470,26 @@ sr_remove_data_files(const char *mod_name)
     }
     free(path);
 
-    if ((err_info = sr_path_ds_shm(mod_name, SR_DS_RUNNING, 0, &path))) {
+    if ((err_info = sr_path_ds_shm(mod_name, SR_DS_RUNNING, &path))) {
         return err_info;
     }
-    if ((shm_unlink(path) == -1) && (errno != ENOENT)) {
+    if ((unlink(path) == -1) && (errno != ENOENT)) {
         SR_LOG_WRN("Failed to unlink \"%s\" (%s).", path, strerror(errno));
     }
     free(path);
 
-    if ((err_info = sr_path_ds_shm(mod_name, SR_DS_OPERATIONAL, 0, &path))) {
+    if ((err_info = sr_path_ds_shm(mod_name, SR_DS_OPERATIONAL, &path))) {
         return err_info;
     }
-    if ((shm_unlink(path) == -1) && (errno != ENOENT)) {
+    if ((unlink(path) == -1) && (errno != ENOENT)) {
         SR_LOG_WRN("Failed to unlink \"%s\" (%s).", path, strerror(errno));
     }
     free(path);
 
-    if ((err_info = sr_path_ds_shm(mod_name, SR_DS_CANDIDATE, 0, &path))) {
+    if ((err_info = sr_path_ds_shm(mod_name, SR_DS_CANDIDATE, &path))) {
         return err_info;
     }
-    if ((shm_unlink(path) == -1) && (errno != ENOENT)) {
+    if ((unlink(path) == -1) && (errno != ENOENT)) {
         SR_LOG_WRN("Failed to unlink \"%s\" (%s).", path, strerror(errno));
     }
     free(path);
@@ -1327,6 +1523,8 @@ sr_module_is_internal(const struct lys_module *ly_mod)
     } else if (!strcmp(ly_mod->name, "sysrepo")) {
         return 1;
     } else if (!strcmp(ly_mod->name, "sysrepo-monitoring")) {
+        return 1;
+    } else if (!strcmp(ly_mod->name, "sysrepo-plugind")) {
         return 1;
     }
 
@@ -1418,16 +1616,78 @@ sr_create_module_imps_incs_r(const struct lys_module *ly_mod)
     return NULL;
 }
 
-sr_error_info_t *
-sr_path_sub_shm(const char *mod_name, const char *suffix1, int64_t suffix2, int abs_path, char **path)
+static sr_error_info_t *
+sr_shm_prefix(const char **prefix)
 {
     sr_error_info_t *err_info = NULL;
+
+    *prefix = getenv(SR_SHM_PREFIX_ENV);
+    if (*prefix == NULL) {
+        *prefix = SR_SHM_PREFIX_DEFAULT;
+    } else if (strchr(*prefix, '/') != NULL) {
+        *prefix = NULL;
+        sr_errinfo_new(&err_info, SR_ERR_INVAL_ARG, NULL, "%s cannot contain slashes.", SR_SHM_PREFIX_ENV);
+    }
+
+    return err_info;
+}
+
+sr_error_info_t *
+sr_path_main_shm(char **path)
+{
+    sr_error_info_t *err_info = NULL;
+    const char *prefix;
+
+    err_info = sr_shm_prefix(&prefix);
+    if (err_info) {
+        return err_info;
+    }
+
+    if (asprintf(path, "%s/%s_main", SR_SHM_DIR, prefix) == -1) {
+        SR_ERRINFO_MEM(&err_info);
+        *path = NULL;
+    }
+
+    return err_info;
+}
+
+sr_error_info_t *
+sr_path_ext_shm(char **path)
+{
+    sr_error_info_t *err_info = NULL;
+    const char *prefix;
+
+    err_info = sr_shm_prefix(&prefix);
+    if (err_info) {
+        return err_info;
+    }
+
+    if (asprintf(path, "%s/%s_ext", SR_SHM_DIR, prefix) == -1) {
+        SR_ERRINFO_MEM(&err_info);
+        *path = NULL;
+    }
+
+    return err_info;
+}
+
+sr_error_info_t *
+sr_path_sub_shm(const char *mod_name, const char *suffix1, int64_t suffix2, char **path)
+{
+    sr_error_info_t *err_info = NULL;
+    const char *prefix;
     int ret;
 
+    err_info = sr_shm_prefix(&prefix);
+    if (err_info) {
+        return err_info;
+    }
+
     if (suffix2 > -1) {
-        ret = asprintf(path, "%s/srsub_%s.%s.%08x", abs_path ? SR_SHM_DIR : "", mod_name, suffix1, (uint32_t)suffix2);
+        ret = asprintf(path, "%s/%ssub_%s.%s.%08x", SR_SHM_DIR,
+                prefix, mod_name, suffix1, (uint32_t)suffix2);
     } else {
-        ret = asprintf(path, "%s/srsub_%s.%s", abs_path ? SR_SHM_DIR : "", mod_name, suffix1);
+        ret = asprintf(path, "%s/%ssub_%s.%s", SR_SHM_DIR,
+                prefix, mod_name, suffix1);
     }
 
     if (ret == -1) {
@@ -1437,14 +1697,21 @@ sr_path_sub_shm(const char *mod_name, const char *suffix1, int64_t suffix2, int 
 }
 
 sr_error_info_t *
-sr_path_ds_shm(const char *mod_name, sr_datastore_t ds, int abs_path, char **path)
+sr_path_ds_shm(const char *mod_name, sr_datastore_t ds, char **path)
 {
     sr_error_info_t *err_info = NULL;
+    const char *prefix;
     int ret;
 
     assert((ds == SR_DS_RUNNING) || (ds == SR_DS_CANDIDATE) || (ds == SR_DS_OPERATIONAL));
 
-    ret = asprintf(path, "%s/sr_%s.%s", abs_path ? SR_SHM_DIR : "", mod_name, sr_ds2str(ds));
+    err_info = sr_shm_prefix(&prefix);
+    if (err_info) {
+        return err_info;
+    }
+
+    ret = asprintf(path, "%s/%s_%s.%s", SR_SHM_DIR,
+            prefix, mod_name, sr_ds2str(ds));
     if (ret == -1) {
         *path = NULL;
         SR_ERRINFO_MEM(&err_info);
@@ -1569,6 +1836,25 @@ sr_path_yang_file(const char *mod_name, const char *mod_rev, char **path)
         ret = asprintf(path, "%s/%s%s%s.yang", SR_YANG_PATH, mod_name, mod_rev ? "@" : "", mod_rev ? mod_rev : "");
     } else {
         ret = asprintf(path, "%s/yang/%s%s%s.yang", sr_get_repo_path(), mod_name, mod_rev ? "@" : "", mod_rev ? mod_rev : "");
+    }
+
+    if (ret == -1) {
+        *path = NULL;
+        SR_ERRINFO_MEM(&err_info);
+    }
+    return err_info;
+}
+
+sr_error_info_t *
+sr_path_conn_lockfile(sr_cid_t cid, char **path)
+{
+    sr_error_info_t *err_info = NULL;
+    int ret;
+
+    if (cid == 0) {
+        ret = asprintf(path, "%s/conn", sr_get_repo_path());
+    } else {
+        ret = asprintf(path, "%s/conn/conn_%" PRIu32 ".lock", sr_get_repo_path(), cid);
     }
 
     if (ret == -1) {
@@ -1869,7 +2155,7 @@ sr_perm_get(const char *mod_name, sr_datastore_t ds, char **owner, char **group,
             return err_info;
         }
     } else {
-        if ((err_info = sr_path_ds_shm(mod_name, ds, 1, &path))) {
+        if ((err_info = sr_path_ds_shm(mod_name, ds, &path))) {
             return err_info;
         }
     }
@@ -1930,21 +2216,6 @@ sr_file_exists(const char *path)
         return 0;
     }
     return 1;
-}
-
-int
-sr_process_exists(pid_t pid)
-{
-    if (!kill(pid, 0)) {
-        return 1;
-    }
-
-    if (errno != ESRCH) {
-        SR_LOG_INF("Failed to check existence of process with PID %ld (%s).", (long)pid, strerror(errno));
-        return 1;
-    }
-
-    return 0;
 }
 
 void
@@ -2059,13 +2330,15 @@ sr_strshmlen(const char *str)
 }
 
 sr_error_info_t *
-sr_shmrealloc_add(sr_shm_t *shm_ext, off_t *shm_array, uint16_t *shm_count, int in_ext_shm, size_t item_size,
-        int32_t add_idx, void **new_item, size_t dyn_attr_size, off_t *dyn_attr_off)
+sr_shmrealloc_add(sr_shm_t *shm_ext, off_t *shm_array_off, uint32_t *shm_count, int in_ext_shm, size_t item_size,
+        int64_t add_idx, void **new_item, size_t dyn_attr_size, off_t *dyn_attr_off)
 {
     sr_error_info_t *err_info = NULL;
-    off_t old_array_off, new_array_off, old_count_off, attr_off;
+    off_t new_array_off, attr_off;
     size_t new_ext_size;
+    char *old_shm_addr;
 
+    assert((*shm_array_off && *shm_count) || (!*shm_array_off && !*shm_count));
     assert((add_idx > -2) && (add_idx <= *shm_count));
     assert(!dyn_attr_size || dyn_attr_off);
 
@@ -2077,12 +2350,6 @@ sr_shmrealloc_add(sr_shm_t *shm_ext, off_t *shm_array, uint16_t *shm_count, int 
         add_idx = *shm_count;
     }
 
-    if (in_ext_shm) {
-        /* remember current offsets in ext SHM */
-        old_array_off = ((char *)shm_array) - shm_ext->addr;
-        old_count_off = ((char *)shm_count) - shm_ext->addr;
-    }
-
     /* we may not even need to resize ext SHM because of the alignment */
     if (SR_SHM_SIZE((*shm_count + 1) * item_size) + dyn_attr_size > SR_SHM_SIZE(*shm_count * item_size)) {
         /* get new offsets and size */
@@ -2090,33 +2357,36 @@ sr_shmrealloc_add(sr_shm_t *shm_ext, off_t *shm_array, uint16_t *shm_count, int 
         attr_off = new_array_off + SR_SHM_SIZE((*shm_count + 1) * item_size);
         new_ext_size = attr_off + dyn_attr_size;
 
+        /* remember current SHM mapping address */
+        old_shm_addr = shm_ext->addr;
+
         /* remap ext SHM */
         if ((err_info = sr_shm_remap(shm_ext, new_ext_size))) {
             return err_info;
         }
 
         if (in_ext_shm) {
-            /* update our pointers */
-            shm_array = (off_t *)(shm_ext->addr + old_array_off);
-            shm_count = (uint16_t *)(shm_ext->addr + old_count_off);
+            /* update our pointers after ext SHM was remapped */
+            shm_array_off = (off_t *)(shm_ext->addr + (((char *)shm_array_off) - old_shm_addr));
+            shm_count = (uint32_t *)(shm_ext->addr + (((char *)shm_count) - old_shm_addr));
         }
 
         /* add wasted memory */
-        *((size_t *)shm_ext->addr) += SR_SHM_SIZE(*shm_count * item_size);
+        ATOMIC_ADD_RELAXED(((sr_ext_shm_t *)shm_ext->addr)->wasted, SR_SHM_SIZE(*shm_count * item_size));
 
         /* copy preceding items */
         if (add_idx) {
-            memcpy(shm_ext->addr + new_array_off, shm_ext->addr + *shm_array, add_idx * item_size);
+            memcpy(shm_ext->addr + new_array_off, shm_ext->addr + *shm_array_off, add_idx * item_size);
         }
 
         /* copy succeeding items */
         if (add_idx < *shm_count) {
             memcpy(shm_ext->addr + new_array_off + (add_idx + 1) * item_size,
-                    shm_ext->addr + *shm_array + add_idx * item_size, (*shm_count - add_idx) * item_size);
+                    shm_ext->addr + *shm_array_off + add_idx * item_size, (*shm_count - add_idx) * item_size);
         }
 
         /* update array and attribute offset */
-        *shm_array = new_array_off;
+        *shm_array_off = new_array_off;
         if (dyn_attr_off && dyn_attr_size) {
             *dyn_attr_off = attr_off;
         }
@@ -2125,39 +2395,48 @@ sr_shmrealloc_add(sr_shm_t *shm_ext, off_t *shm_array, uint16_t *shm_count, int 
         assert(!dyn_attr_size);
 
         /* we only need to move succeeding items */
-        memmove(shm_ext->addr + *shm_array + (add_idx + 1) * item_size,
-                shm_ext->addr + *shm_array + add_idx * item_size, (*shm_count - add_idx) * item_size);
+        memmove(shm_ext->addr + *shm_array_off + (add_idx + 1) * item_size,
+                shm_ext->addr + *shm_array_off + add_idx * item_size, (*shm_count - add_idx) * item_size);
     }
 
     /* return pointer to the new item and update count */
-    *new_item = (shm_ext->addr + *shm_array) + (add_idx * item_size);
+    *new_item = (shm_ext->addr + *shm_array_off) + (add_idx * item_size);
     ++(*shm_count);
 
     return NULL;
 }
 
 void
-sr_shmrealloc_del(char *ext_shm_addr, off_t *shm_array, uint16_t *shm_count, size_t item_size, uint16_t del_idx,
+sr_shmrealloc_del(char *ext_shm_addr, off_t *shm_array_off, uint32_t *shm_count, size_t item_size, uint32_t del_idx,
         size_t dyn_shm_size)
 {
     /* add wasted memory keeping alignment in mind */
-    *((size_t *)ext_shm_addr) += SR_SHM_SIZE(*shm_count * item_size) - SR_SHM_SIZE((*shm_count - 1) * item_size);
-    *((size_t *)ext_shm_addr) += dyn_shm_size;
+    ATOMIC_ADD_RELAXED(((sr_ext_shm_t *)ext_shm_addr)->wasted, SR_SHM_SIZE(*shm_count * item_size)
+        - SR_SHM_SIZE((*shm_count - 1) * item_size));
+    ATOMIC_ADD_RELAXED(((sr_ext_shm_t *)ext_shm_addr)->wasted, dyn_shm_size);
 
     --(*shm_count);
     if (!*shm_count) {
         /* the only item removed */
-        *shm_array = 0;
+        *shm_array_off = 0;
     } else if (del_idx < *shm_count) {
         /* move all following items, we may need to keep the order intact */
-        memmove((ext_shm_addr + *shm_array) + (del_idx * item_size),
-                (ext_shm_addr + *shm_array) + ((del_idx + 1) * item_size),
+        memmove((ext_shm_addr + *shm_array_off) + (del_idx * item_size),
+                (ext_shm_addr + *shm_array_off) + ((del_idx + 1) * item_size),
                 (*shm_count - del_idx) * item_size);
     }
 }
 
-sr_error_info_t *
-sr_mutex_init(pthread_mutex_t *lock, int shared)
+/**
+ * @brief Wrapper for pthread_mutex_init().
+ *
+ * @param[in,out] lock pthread mutex to initialize.
+ * @param[in] shared Whether the mutex will be shared between processes or not.
+ * @param[in] robust Whether the mutex should support recovery after its owner dies or not.
+ * @return err_info, NULL on success.
+ */
+static sr_error_info_t *
+_sr_mutex_init(pthread_mutex_t *lock, int shared, int robust)
 {
     sr_error_info_t *err_info = NULL;
     pthread_mutexattr_t attr;
@@ -2169,13 +2448,20 @@ sr_mutex_init(pthread_mutex_t *lock, int shared)
         return err_info;
     }
 
-    if (shared) {
+    if (shared || robust) {
         /* init attr */
         if ((ret = pthread_mutexattr_init(&attr))) {
             sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Initializing pthread attr failed (%s).", strerror(ret));
             return err_info;
         }
-        if ((ret = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED))) {
+
+        if (shared && (ret = pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED))) {
+            pthread_mutexattr_destroy(&attr);
+            sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Changing pthread attr failed (%s).", strerror(ret));
+            return err_info;
+        }
+
+        if (robust && (ret = pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST))) {
             pthread_mutexattr_destroy(&attr);
             sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Changing pthread attr failed (%s).", strerror(ret));
             return err_info;
@@ -2198,7 +2484,13 @@ sr_mutex_init(pthread_mutex_t *lock, int shared)
 }
 
 sr_error_info_t *
-sr_mlock(pthread_mutex_t *lock, int timeout_ms, const char *func)
+sr_mutex_init(pthread_mutex_t *lock, int shared)
+{
+    return _sr_mutex_init(lock, shared, shared);
+}
+
+sr_error_info_t *
+sr_mlock(pthread_mutex_t *lock, int timeout_ms, const char *func, sr_lock_recover_cb cb, void *cb_data)
 {
     sr_error_info_t *err_info = NULL;
     struct timespec abs_ts;
@@ -2212,7 +2504,19 @@ sr_mlock(pthread_mutex_t *lock, int timeout_ms, const char *func)
         sr_time_get(&abs_ts, (uint32_t)timeout_ms);
         ret = pthread_mutex_timedlock(lock, &abs_ts);
     }
-    if (ret) {
+
+    if (ret == EOWNERDEAD) {
+        /* make consistent */
+        ret = pthread_mutex_consistent(lock);
+        SR_CHECK_INT_RET(ret, err_info);
+
+        /* recover */
+        if (cb) {
+            cb(SR_LOCK_WRITE, 0, cb_data);
+        }
+
+        SR_LOG_WRN("Recovered a lock with a dead owner (%s).", func);
+    } else if (ret) {
         SR_ERRINFO_LOCK(&err_info, func, ret);
         return err_info;
     }
@@ -2287,11 +2591,19 @@ sr_rwlock_init(sr_rwlock_t *rwlock, int shared)
     if ((err_info = sr_mutex_init(&rwlock->mutex, shared))) {
         return err_info;
     }
-    rwlock->readers = 0;
     if ((err_info = sr_cond_init(&rwlock->cond, shared))) {
         pthread_mutex_destroy(&rwlock->mutex);
         return err_info;
     }
+
+    if ((err_info = _sr_mutex_init(&rwlock->r_mutex, shared, 0))) {
+        pthread_mutex_destroy(&rwlock->mutex);
+        pthread_cond_destroy(&rwlock->cond);
+        return err_info;
+    }
+    memset(rwlock->readers, 0, sizeof rwlock->readers);
+    rwlock->upgr = 0;
+    rwlock->writer = 0;
 
     return NULL;
 }
@@ -2301,63 +2613,369 @@ sr_rwlock_destroy(sr_rwlock_t *rwlock)
 {
     pthread_mutex_destroy(&rwlock->mutex);
     pthread_cond_destroy(&rwlock->cond);
+    pthread_mutex_destroy(&rwlock->r_mutex);
+}
+
+/**
+ * @brief Add a reader CID to a rwlock.
+ *
+ * @param[in] rwlock Lock to add a reader to.
+ * @param[in] cid Owner CID.
+ */
+static void
+sr_rwlock_reader_add(sr_rwlock_t *rwlock, sr_cid_t cid)
+{
+    sr_error_info_t *err_info = NULL;
+    int ret;
+    uint32_t i;
+
+    /* READ MUTEX LOCK */
+    ret = pthread_mutex_lock(&rwlock->r_mutex);
+    if (ret) {
+        SR_ERRINFO_INT(&err_info);
+        sr_errinfo_free(&err_info);
+    }
+
+    /* find first free item */
+    for (i = 0; rwlock->readers[i] && (i < SR_RWLOCK_READ_LIMIT); ++i) {}
+    if (i == SR_RWLOCK_READ_LIMIT) {
+        sr_errinfo_new(&err_info, SR_ERR_INTERNAL, NULL, "Concurrent reader limit %d reached!", SR_RWLOCK_READ_LIMIT);
+        sr_errinfo_free(&err_info);
+        goto unlock;
+    }
+
+    /* assign owner cid */
+    rwlock->readers[i] = cid;
+
+unlock:
+    if (!ret) {
+        /* READ MUTEX UNLOCK */
+        pthread_mutex_unlock(&rwlock->r_mutex);
+    }
+}
+
+static void
+sr_rwlock_reader_del_(sr_cid_t *readers, uint32_t i)
+{
+    /* move all the following CIDs so that there are no holes */
+    while ((i < (SR_RWLOCK_READ_LIMIT - 1)) && readers[i + 1]) {
+        readers[i] = readers[i + 1];
+        ++i;
+    }
+
+    /* remove the last CID */
+    readers[i] = 0;
+}
+
+/**
+ * @brief Remove a reader CID from a rwlock.
+ *
+ * @param[in] rwlock Lock to remove a reader from.
+ * @param[in] cid Owner CID.
+ */
+static void
+sr_rwlock_reader_del(sr_rwlock_t *rwlock, sr_cid_t cid)
+{
+    sr_error_info_t *err_info = NULL;
+    int ret;
+    uint32_t i;
+
+    /* READ MUTEX LOCK */
+    ret = pthread_mutex_lock(&rwlock->r_mutex);
+    if (ret) {
+        SR_ERRINFO_INT(&err_info);
+        sr_errinfo_free(&err_info);
+    }
+
+    /* find a CID match */
+    for (i = 0; rwlock->readers[i] && (rwlock->readers[i] != cid) && (i < SR_RWLOCK_READ_LIMIT); ++i) {}
+    if ((i == SR_RWLOCK_READ_LIMIT) || (rwlock->readers[i] != cid)) {
+        /* CID not found */
+        SR_ERRINFO_INT(&err_info);
+        sr_errinfo_free(&err_info);
+        goto unlock;
+    }
+
+    /* remove the CID */
+    sr_rwlock_reader_del_(rwlock->readers, i);
+
+unlock:
+    if (!ret) {
+        /* READ MUTEX UNLOCK */
+        pthread_mutex_unlock(&rwlock->r_mutex);
+    }
+}
+
+/**
+ * @brief Recover a sysrepo RW lock.
+ * Mutex must be held!
+ *
+ * @param[in] rwlock RW lock to recover.
+ * @param[in] func Lock caller function.
+ * @param[in] cb Optional callback to call for each recovered lock.
+ * @param[in] cb_data User data for @p cb.
+ */
+static void
+sr_rwlock_recover(sr_rwlock_t *rwlock, const char *func, sr_lock_recover_cb cb, void *cb_data)
+{
+    uint32_t i = 0;
+    sr_cid_t cid;
+
+    /* readers */
+    while (rwlock->readers[i] && (i < SR_RWLOCK_READ_LIMIT)) {
+        if (!sr_conn_is_alive(rwlock->readers[i])) {
+            /* remove the dead reader */
+            cid = rwlock->readers[i];
+            sr_rwlock_reader_del_(rwlock->readers, i);
+
+            /* recover */
+            if (cb) {
+                cb(SR_LOCK_READ, cid, cb_data);
+            }
+            SR_LOG_WRN("Recovered a read-lock of CID %" PRIu32 " (%s).", cid, func);
+        } else {
+            ++i;
+        }
+    }
+
+    /* read-upgr */
+    if (rwlock->upgr) {
+        if (!sr_conn_is_alive(rwlock->upgr)) {
+            cid = rwlock->upgr;
+            rwlock->upgr = 0;
+
+            /* recover */
+            if (cb) {
+                cb(SR_LOCK_READ_UPGR, cid, cb_data);
+            }
+            SR_LOG_WRN("Recovered a read-upgr-lock of CID %" PRIu32 " (%s).", cid, func);
+        }
+    }
+
+    /* write */
+    if (rwlock->writer) {
+        if (!sr_conn_is_alive(rwlock->writer)) {
+            cid = rwlock->writer;
+            rwlock->writer = 0;
+
+            /* recover */
+            if (cb) {
+                cb(SR_LOCK_WRITE, cid, cb_data);
+            }
+            SR_LOG_WRN("Recovered a write-lock of CID %" PRIu32 " (%s).", cid, func);
+        }
+    }
 }
 
 sr_error_info_t *
-sr_rwlock(sr_rwlock_t *rwlock, int timeout_ms, sr_lock_mode_t mode, const char *func)
+sr_rwlock(sr_rwlock_t *rwlock, int timeout_ms, sr_lock_mode_t mode, sr_cid_t cid, const char *func,
+        sr_lock_recover_cb cb, void *cb_data)
 {
     sr_error_info_t *err_info = NULL;
     struct timespec timeout_ts;
     int ret;
 
-    assert(mode != SR_LOCK_NONE);
-    assert(timeout_ms > 0);
+    assert(mode && (timeout_ms > 0) && cid);
+
     sr_time_get(&timeout_ts, timeout_ms);
 
     /* MUTEX LOCK */
     ret = pthread_mutex_timedlock(&rwlock->mutex, &timeout_ts);
-    if (ret) {
+
+    if (ret == EOWNERDEAD) {
+        /* make it consistent */
+        ret = pthread_mutex_consistent(&rwlock->mutex);
+
+        /* recover the lock */
+        assert(rwlock->writer);
+        sr_rwlock_recover(rwlock, func, cb, cb_data);
+        assert(!rwlock->writer);
+        SR_CHECK_INT_RET(ret, err_info);
+    } else if (ret) {
         SR_ERRINFO_LOCK(&err_info, func, ret);
         return err_info;
     }
 
     if (mode == SR_LOCK_WRITE) {
         /* write lock */
+        if (rwlock->readers[0]) {
+            /* instead of waiting, try to recover the lock immediately */
+            sr_rwlock_recover(rwlock, func, cb, cb_data);
+        }
+
+        /* wait until there are no readers */
         ret = 0;
-        while (!ret && rwlock->readers) {
+        while (!ret && rwlock->readers[0]) {
             /* COND WAIT */
             ret = pthread_cond_timedwait(&rwlock->cond, &rwlock->mutex, &timeout_ts);
         }
-
-        if (ret) {
-            /* MUTEX UNLOCK */
-            pthread_mutex_unlock(&rwlock->mutex);
-
-            SR_ERRINFO_COND(&err_info, func, ret);
-            return err_info;
+        if (ret == ETIMEDOUT) {
+            /* recover the lock again, the owner may have died while processing */
+            sr_rwlock_recover(rwlock, func, cb, cb_data);
+            if (!rwlock->readers[0]) {
+                /* recovered */
+                ret = 0;
+            }
         }
+        if (ret) {
+            goto error_cond_unlock;
+        }
+
+        /* consistency checks */
+        assert(!rwlock->upgr && !rwlock->writer);
+
+        /* set writer flag */
+        rwlock->writer = cid;
     } else {
         /* read lock */
-        ++rwlock->readers;
+        if (mode == SR_LOCK_READ_UPGR) {
+            if (rwlock->readers[0]) {
+                /* instead of waiting, try to recover the lock immediately */
+                sr_rwlock_recover(rwlock, func, cb, cb_data);
+            }
+
+            /* wait until there is no read-upgr lock */
+            ret = 0;
+            while (!ret && rwlock->upgr) {
+                /* COND WAIT */
+                ret = pthread_cond_timedwait(&rwlock->cond, &rwlock->mutex, &timeout_ts);
+            }
+            if (ret == ETIMEDOUT) {
+                /* recover the lock again, the owner may have died while processing */
+                sr_rwlock_recover(rwlock, func, cb, cb_data);
+                if (!rwlock->upgr) {
+                    /* recovered */
+                    ret = 0;
+                }
+            }
+            if (ret) {
+                goto error_cond_unlock;
+            }
+
+            /* set upgradeable flag */
+            rwlock->upgr = cid;
+        }
+
+        /* add a reader */
+        sr_rwlock_reader_add(rwlock, cid);
 
         /* MUTEX UNLOCK */
         pthread_mutex_unlock(&rwlock->mutex);
     }
 
     return NULL;
+
+error_cond_unlock:
+    /* MUTEX UNLOCK */
+    pthread_mutex_unlock(&rwlock->mutex);
+
+    SR_ERRINFO_COND(&err_info, func, ret);
+    return err_info;
 }
 
-void
-sr_rwunlock(sr_rwlock_t *rwlock, sr_lock_mode_t mode, const char *func)
+sr_error_info_t *
+sr_rwrelock(sr_rwlock_t *rwlock, int timeout_ms, sr_lock_mode_t mode, sr_cid_t cid, const char *func,
+        sr_lock_recover_cb cb, void *cb_data)
 {
     sr_error_info_t *err_info = NULL;
     struct timespec timeout_ts;
     int ret;
 
-    assert(mode != SR_LOCK_NONE);
+    assert(mode && cid);
+    assert((mode != SR_LOCK_WRITE) || (timeout_ms > 0));
 
-    if (mode == SR_LOCK_READ) {
-        sr_time_get(&timeout_ts, SR_RWLOCK_READ_TIMEOUT);
+    if (mode == SR_LOCK_WRITE) {
+        /*
+         * upgrade from upgradeable read-lock to write-lock
+         */
+        sr_time_get(&timeout_ts, timeout_ms);
+
+        /* MUTEX LOCK */
+        ret = pthread_mutex_timedlock(&rwlock->mutex, &timeout_ts);
+        if (ret) {
+            SR_ERRINFO_LOCK(&err_info, func, ret);
+            return err_info;
+        }
+
+        /* consistency checks */
+        assert(rwlock->upgr == cid);
+
+        /* remove our reader */
+        sr_rwlock_reader_del(rwlock, cid);
+
+        if (rwlock->readers[0]) {
+            /* instead of waiting, try to recover the lock immediately */
+            sr_rwlock_recover(rwlock, func, cb, cb_data);
+        }
+
+        /* wait until there are no readers */
+        ret = 0;
+        while (!ret && rwlock->readers[0]) {
+            /* COND WAIT */
+            ret = pthread_cond_timedwait(&rwlock->cond, &rwlock->mutex, &timeout_ts);
+        }
+        if (ret == ETIMEDOUT) {
+            sr_rwlock_recover(rwlock, func, cb, cb_data);
+            if (!rwlock->readers[0]) {
+                /* recovered */
+                ret = 0;
+            }
+        }
+        if (ret) {
+            /* put back our reader */
+            sr_rwlock_reader_add(rwlock, cid);
+
+            SR_ERRINFO_COND(&err_info, func, ret);
+            goto cleanup_unlock;
+        }
+
+        /* additional consistency check */
+        assert(rwlock->upgr == cid);
+
+        /* update flags */
+        rwlock->upgr = 0;
+        rwlock->writer = cid;
+
+        /* simply keep the lock */
+        return NULL;
+    }
+
+    /*
+     * downgrade from write-lock to read-lock (optionally with upgrade capability)
+     */
+
+    /* consistency checks */
+    assert(!rwlock->readers[0] && !rwlock->upgr && (rwlock->writer == cid));
+
+    /* remove writer flag */
+    rwlock->writer = 0;
+
+    if (mode == SR_LOCK_READ_UPGR) {
+        /* we want the upgrade capability */
+        rwlock->upgr = cid;
+    }
+
+    /* add a reader */
+    sr_rwlock_reader_add(rwlock, cid);
+
+cleanup_unlock:
+    /* MUTEX UNLOCK */
+    pthread_mutex_unlock(&rwlock->mutex);
+    return err_info;
+}
+
+void
+sr_rwunlock(sr_rwlock_t *rwlock, int timeout_ms, sr_lock_mode_t mode, sr_cid_t cid, const char *func)
+{
+    sr_error_info_t *err_info = NULL;
+    struct timespec timeout_ts;
+    int ret;
+
+    assert(mode && cid);
+    assert((mode == SR_LOCK_WRITE) || (timeout_ms > 0));
+
+    if ((mode == SR_LOCK_READ) || (mode == SR_LOCK_READ_UPGR)) {
+        sr_time_get(&timeout_ts, timeout_ms);
 
         /* MUTEX LOCK */
         ret = pthread_mutex_timedlock(&rwlock->mutex, &timeout_ts);
@@ -2366,25 +2984,47 @@ sr_rwunlock(sr_rwlock_t *rwlock, sr_lock_mode_t mode, const char *func)
             sr_errinfo_free(&err_info);
         }
 
-        if (!rwlock->readers) {
-            SR_ERRINFO_INT(&err_info);
-            sr_errinfo_free(&err_info);
-        } else {
-            /* remove a reader */
-            --rwlock->readers;
+        if (mode == SR_LOCK_READ_UPGR) {
+            assert(rwlock->upgr == cid);
+
+            /* remove the upgradeable flag */
+            rwlock->upgr = 0;
         }
+
+        /* remove this reader */
+        sr_rwlock_reader_del(rwlock, cid);
+    } else {
+        /* we are unlocking a write lock, there can be no readers */
+        assert(!rwlock->readers[0] && !rwlock->upgr && (rwlock->writer == cid));
+
+        /* remove the writer flag */
+        rwlock->writer = 0;
     }
 
-    /* we are unlocking a write lock, there can be no readers */
-    assert((mode == SR_LOCK_READ) || !rwlock->readers);
-
-    if (!rwlock->readers) {
+    /* write-unlock, last read-unlock, or upgradeable read-lock (there may be another upgr-read-lock waiting) */
+    if (!rwlock->readers[0] || (mode == SR_LOCK_READ_UPGR)) {
         /* broadcast on condition */
         pthread_cond_broadcast(&rwlock->cond);
     }
 
     /* MUTEX UNLOCK */
     pthread_mutex_unlock(&rwlock->mutex);
+}
+
+int
+sr_conn_is_alive(sr_cid_t cid)
+{
+    int alive = 0;
+    sr_error_info_t *err_info;
+
+    if ((err_info = sr_shmmain_conn_check(cid, &alive, NULL))) {
+        SR_LOG_WRN("Failed to check connection %"PRIu32" aliveness.", cid);
+        sr_errinfo_free(&err_info);
+        /* if check fails, assume the connection is alive */
+        alive = 1;
+    }
+
+    return alive;
 }
 
 void *
@@ -2401,7 +3041,7 @@ sr_realloc(void *ptr, size_t size)
 }
 
 sr_error_info_t *
-sr_cp_file2shm(const char *to, const char *from, mode_t perm)
+sr_cp_path(const char *to, const char *from, mode_t file_mode)
 {
     sr_error_info_t *err_info = NULL;
     int fd_to = -1, fd_from = -1;
@@ -2410,20 +3050,20 @@ sr_cp_file2shm(const char *to, const char *from, mode_t perm)
     mode_t um;
 
     /* open "from" file */
-    fd_from = open(from, O_RDONLY);
+    fd_from = SR_OPEN(from, O_RDONLY, 0);
     if (fd_from < 0) {
         sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Opening \"%s\" file failed (%s).", from, strerror(errno));
         goto cleanup;
     }
 
     /* set umask so that the correct permissions are really set */
-    um = umask(00000);
+    um = umask(SR_UMASK);
 
-    /* open "to" SHM */
-    fd_to = shm_open(to, O_WRONLY | O_TRUNC | O_CREAT, perm);
+    /* open "to" */
+    fd_to = SR_OPEN(to, O_WRONLY | O_TRUNC | O_CREAT, file_mode);
     umask(um);
     if (fd_to < 0) {
-        sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Opening \"%s\" SHM failed (%s).", to, strerror(errno));
+        sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Opening \"%s\" failed (%s).", to, strerror(errno));
         goto cleanup;
     }
 
@@ -2467,7 +3107,7 @@ sr_mkpath(char *path, mode_t mode)
     assert(path[0] == '/');
 
     /* set umask so that the correct permissions are really set */
-    um = umask(00000);
+    um = umask(SR_UMASK);
 
     for (p = strchr(path + 1, '/'); p; p = strchr(p + 1, '/')) {
         *p = '\0';
@@ -2510,7 +3150,7 @@ sr_get_first_ns(const char *expr)
     if (!isalpha(expr[0]) && (expr[0] != '_')) {
         return NULL;
     }
-    for (i = 1; expr[i] && (isalnum(expr[i]) || (expr[i] == '_') || (expr[i] == '-') || (expr[i] == '.')); ++i);
+    for (i = 1; expr[i] && (isalnum(expr[i]) || (expr[i] == '_') || (expr[i] == '-') || (expr[i] == '.')); ++i) {}
     if (expr[i] != ':') {
         return NULL;
     }
@@ -2557,14 +3197,14 @@ sr_get_trim_predicates(const char *expr, char **expr2)
         }
     }
 
-    /* copy last expr chunk */
-    strncat(str, start, ptr - start);
-
     if (quot || pred) {
         sr_errinfo_new(&err_info, SR_ERR_INVAL_ARG, NULL, "Unterminated %s in expression.", quot ? "literal" : "predicate");
         free(str);
         return err_info;
     }
+
+    /* copy last expr chunk */
+    strncat(str, start, ptr - start);
 
     *expr2 = str;
     return NULL;
@@ -2915,7 +3555,7 @@ sr_val_ly2sr(const struct lyd_node *node, sr_val_t *sr_val)
             free(any->value.mem);
             any->value_type = LYD_ANYDATA_DATATREE;
             any->value.tree = tree;
-            /* fallthrough */
+        /* fallthrough */
         case LYD_ANYDATA_DATATREE:
             lyd_print_mem(&ptr, any->value.tree, LYD_XML, LYP_FORMAT | LYP_WITHSIBLINGS);
             break;
@@ -2969,7 +3609,7 @@ sr_val_sr2ly_str(struct ly_ctx *ctx, const sr_val_t *sr_val, const char *xpath, 
     case SR_INSTANCEID_T:
     case SR_ANYDATA_T:
     case SR_ANYXML_T:
-        return (sr_val->data.string_val);
+        return sr_val->data.string_val;
     case SR_LEAF_EMPTY_T:
         return NULL;
     case SR_BOOL_T:
@@ -2985,7 +3625,7 @@ sr_val_sr2ly_str(struct ly_ctx *ctx, const sr_val_t *sr_val, const char *xpath, 
             t = &t->info.lref.target->type;
         }
         if (t->base == LY_TYPE_UNION) {
-            for (t2 = lys_getnext_union_type(NULL, t); t2->base != LY_TYPE_DEC64; t2 = lys_getnext_union_type(t2, t));
+            for (t2 = lys_getnext_union_type(NULL, t); t2->base != LY_TYPE_DEC64; t2 = lys_getnext_union_type(t2, t)) {}
             t = t2;
         }
         if (!t) {
@@ -2994,28 +3634,28 @@ sr_val_sr2ly_str(struct ly_ctx *ctx, const sr_val_t *sr_val, const char *xpath, 
         sprintf(buf, "%.*f", t->info.dec64.dig, sr_val->data.decimal64_val);
         return buf;
     case SR_UINT8_T:
-        sprintf(buf, "%"PRIu8, sr_val->data.uint8_val);
+        sprintf(buf, "%" PRIu8, sr_val->data.uint8_val);
         return buf;
     case SR_UINT16_T:
-        sprintf(buf, "%"PRIu16, sr_val->data.uint16_val);
+        sprintf(buf, "%" PRIu16, sr_val->data.uint16_val);
         return buf;
     case SR_UINT32_T:
-        sprintf(buf, "%"PRIu32, sr_val->data.uint32_val);
+        sprintf(buf, "%" PRIu32, sr_val->data.uint32_val);
         return buf;
     case SR_UINT64_T:
-        sprintf(buf, "%"PRIu64, sr_val->data.uint64_val);
+        sprintf(buf, "%" PRIu64, sr_val->data.uint64_val);
         return buf;
     case SR_INT8_T:
-        sprintf(buf, "%"PRId8, sr_val->data.int8_val);
+        sprintf(buf, "%" PRId8, sr_val->data.int8_val);
         return buf;
     case SR_INT16_T:
-        sprintf(buf, "%"PRId16, sr_val->data.int16_val);
+        sprintf(buf, "%" PRId16, sr_val->data.int16_val);
         return buf;
     case SR_INT32_T:
-        sprintf(buf, "%"PRId32, sr_val->data.int32_val);
+        sprintf(buf, "%" PRId32, sr_val->data.int32_val);
         return buf;
     case SR_INT64_T:
-        sprintf(buf, "%"PRId64, sr_val->data.int64_val);
+        sprintf(buf, "%" PRId64, sr_val->data.int64_val);
         return buf;
     default:
         return NULL;
@@ -3057,7 +3697,7 @@ sr_ly_split(struct lyd_node *sibling)
     assert(!sibling->parent);
 
     /* find first and last node */
-    for (first = sibling->prev; first->prev->next; first = first->prev);
+    for (first = sibling->prev; first->prev->next; first = first->prev) {}
     last = first->prev;
 
     /* correct left sibling list */
@@ -3158,23 +3798,21 @@ sr_lyd_child(const struct lyd_node *node, int skip_keys)
 }
 
 /**
- * @brief Copy any NP containers from source to target. Processes only this level meaning it
- * only traverses source siblings to look for NP containers. However, if any container is copied,
- * all its nested NP containers are also copied, recursively.
+ * @brief Copy any existing config NP containers, recursively.
  *
- * @param[in,out] trg_sibling Any target sibling, NULL if there are none.
- * @param[in] trg_parent Target parent of the first sibling, NULL if its top-level.
+ * @param[in,out] first First sibling, not needed if @p parent is set.
+ * @param[in] parent Parent of any copied containers.
  * @param[in] src_sibling Any source sibling to look for existing NP containers.
- * @param[in] ly_mod Only containers from this module will be duplicated
+ * @param[in] ly_mod Module, whose top-level containers to create, if @p first is set.
  * @return err_info, NULL on success.
  */
 static sr_error_info_t *
-sr_lyd_copy_np_cont_r(struct lyd_node **trg_sibling, struct lyd_node *trg_parent, const struct lyd_node *src_sibling,
+sr_lyd_copy_config_np_cont_r(struct lyd_node **first, struct lyd_node *parent, const struct lyd_node *src_sibling,
         const struct lys_module *ly_mod)
 {
     sr_error_info_t *err_info = NULL;
     const struct lyd_node *src, *src_top;
-    struct lyd_node *trg;
+    struct lyd_node *node;
 
     assert(ly_mod);
 
@@ -3183,18 +3821,8 @@ sr_lyd_copy_np_cont_r(struct lyd_node **trg_sibling, struct lyd_node *trg_parent
         return NULL;
     }
 
-    /* find first siblings */
-    if (trg_sibling && *trg_sibling) {
-        while ((*trg_sibling)->prev->next) {
-            (*trg_sibling) = (*trg_sibling)->prev;
-        }
-    }
-    while (src_sibling->prev->next) {
-        src_sibling = src_sibling->prev;
-    }
-
     for (src = src_sibling; src; src = src->next) {
-        for (src_top = src; src_top->parent; src_top = src_top->parent);
+        for (src_top = src; src_top->parent; src_top = src_top->parent) {}
         if (lyd_node_module(src_top) != ly_mod) {
             /* these data do not belong to this module */
             continue;
@@ -3205,41 +3833,199 @@ sr_lyd_copy_np_cont_r(struct lyd_node **trg_sibling, struct lyd_node *trg_parent
             continue;
         }
 
-        /* check that it does not exist in the new data */
-        trg = NULL;
-        if (trg_sibling) {
-            for (trg = *trg_sibling; trg; trg = trg->next) {
-                if (trg->schema == src->schema) {
-                    break;
-                }
-            }
-        }
-        if (trg) {
-            /* it already exists */
+        lyd_find_sibling_val(parent ? parent->child : *first, src->schema, NULL, &node);
+        if (node) {
+            /* container already exists */
             continue;
         }
 
         /* create the NP container */
-        trg = lyd_new(trg_parent, lyd_node_module(src), src->schema->name);
-        if (!trg) {
+        node = lyd_new(parent, lyd_node_module(src), src->schema->name);
+        if (!node) {
             sr_errinfo_new_ly(&err_info, lyd_node_module(src)->ctx);
             return err_info;
         }
-        trg->dflt = 1;
 
-        /* connect it if needed */
-        if (!trg_parent) {
-            if (!*trg_sibling) {
-                *trg_sibling = trg;
-            } else if (lyd_insert_sibling(trg_sibling, trg)) {
-                lyd_free(trg);
-                sr_errinfo_new_ly(&err_info, lyd_node_module(src)->ctx);
-                return err_info;
+        if (!parent) {
+            /* connect it */
+            if (*first) {
+                lyd_insert_sibling(first, node);
+            } else {
+                *first = node;
             }
         }
 
         /* copy any nested NP containers */
-        if ((err_info = sr_lyd_copy_np_cont_r(NULL, trg, src->child, ly_mod))) {
+        if ((err_info = sr_lyd_copy_config_np_cont_r(NULL, node, src->child, ly_mod))) {
+            return err_info;
+        }
+
+        /* set the default flag after all nested containers were copied */
+        node->dflt = 1;
+    }
+
+    return NULL;
+}
+
+/**
+ * @brief Decide whether a container has meaning, which causes it not to be created automatically as
+ * a special default value.
+ *
+ * @param[in] snode Schema node of the container to examine.
+ * @param[in] siblings First data sibling of the container.
+ * @return 0 if it has no meaning and should be created automatically,
+ * @return non-zero otherwise.
+ */
+static int
+sr_lyd_cont_has_meaning(const struct lys_node *snode, const struct lyd_node *siblings)
+{
+    const struct lys_node *schild;
+    struct lyd_node *node;
+
+    assert(snode->nodetype == LYS_CONTAINER);
+
+    if (((struct lys_node_container *)snode)->presence) {
+        /* presence containers always carry some meaning */
+        return 1;
+    }
+
+    assert(!lys_parent(snode) || (lys_parent(snode)->nodetype != LYS_CHOICE));
+    if (lys_parent(snode) && (lys_parent(snode)->nodetype == LYS_CASE)) {
+        /* container is in a case and in case no other nodes from the case exist, it would carry
+         * meaning of selecting the case */
+        schild = NULL;
+        while ((schild = lys_getnext(schild, lys_parent(snode), NULL, 0))) {
+            if (schild == snode) {
+                continue;
+            }
+
+            /* does this other node from the case exist? */
+            lyd_find_sibling_val(siblings, schild, NULL, &node);
+            if (node) {
+                /* this other node exists meaning this NP container has no meaning */
+                return 0;
+            }
+        }
+
+        /* no data from this case exist and this NP container existence would mean this case is selected */
+        return 1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Create config/state/both NP containers, recursively.
+ *
+ * @param[in,out] first First sibling, not needed if @p parent is set.
+ * @param[in] parent Parent of any created containers.
+ * @param[in] ly_mod Module, whose top-level containers to create, if @p first is set.
+ * @param[in] config_f Config flag of the created containers, bitfied of ::LYS_CONFIG_W and ::LYS_CONFIG_R.
+ * @param[in,out] diff Optional diff to merge any performed changes in.
+ * @return err_info, NULL on success.
+ */
+static sr_error_info_t *
+sr_lyd_create_np_cont_r(struct lyd_node **first, struct lyd_node *parent, const struct lys_module *ly_mod, int config_f,
+        struct lyd_node **diff)
+{
+    sr_error_info_t *err_info = NULL;
+    const struct lys_node *snode = NULL;
+    struct ly_ctx *ly_ctx;
+    struct lyd_node *node, *new_diff;
+
+    assert(parent || (ly_mod && first));
+
+    ly_ctx = parent ? lyd_node_module(parent)->ctx : ly_mod->ctx;
+
+    while ((snode = lys_getnext(snode, parent ? parent->schema : NULL, ly_mod, 0))) {
+        if (!(snode->flags & config_f) || (snode->nodetype != LYS_CONTAINER) ||
+                sr_lyd_cont_has_meaning(snode, parent ? parent->child : *first)) {
+            /* not a container, wrong config, or the container has meaning so we do not create it automatically */
+            continue;
+        }
+
+        lyd_find_sibling_val(parent ? parent->child : *first, snode, NULL, &node);
+        if (node) {
+            /* container already exists */
+            continue;
+        }
+
+        /* create the NP container */
+        node = lyd_new(parent, lys_node_module(snode), snode->name);
+        if (!node) {
+            sr_errinfo_new_ly(&err_info, ly_ctx);
+            return err_info;
+        }
+
+        if (!parent) {
+            /* connect it */
+            if (*first) {
+                lyd_insert_sibling(first, node);
+            } else {
+                *first = node;
+            }
+        }
+
+        if (diff) {
+            /* add (merge) into diff */
+            new_diff = lyd_dup(node, LYD_DUP_OPT_WITH_PARENTS | LYD_DUP_OPT_WITH_KEYS);
+            sr_edit_set_oper(new_diff, "create");
+            if (new_diff->parent) {
+                do {
+                    new_diff = new_diff->parent;
+                } while (new_diff->parent);
+                sr_edit_set_oper(new_diff, "none");
+            }
+            err_info = sr_diff_mod_merge(new_diff, NULL, lyd_node_module(new_diff), diff, NULL);
+            lyd_free(new_diff);
+            if (err_info) {
+                return err_info;
+            }
+        }
+
+        /* recursively create any nested NP containers */
+        if ((err_info = sr_lyd_create_np_cont_r(NULL, node, NULL, config_f, diff))) {
+            return err_info;
+        }
+
+        /* set the default flag after all nested containers were added */
+        node->dflt = 1;
+    }
+
+    return NULL;
+}
+
+sr_error_info_t *
+sr_lyd_create_sibling_np_cont_r(struct lyd_node **first, struct lyd_node *parent, const struct lys_module *ly_mod,
+        struct lyd_node **diff)
+{
+    sr_error_info_t *err_info;
+    struct lyd_node *subtree, *next, *elem;
+
+    assert((first && ly_mod) || parent);
+
+    /* add all nested NP containers */
+    LY_TREE_FOR(parent ? sr_lyd_child(parent, 1) : *first, subtree) {
+        if (first && (lyd_node_module(subtree) != ly_mod)) {
+            continue;
+        }
+
+        LY_TREE_DFS_BEGIN(subtree, next, elem) {
+            if ((err_info = sr_lyd_create_np_cont_r(NULL, elem, NULL, LYS_CONFIG_R | LYS_CONFIG_W, diff))) {
+                return err_info;
+            }
+
+            LY_TREE_DFS_END(subtree, next, elem);
+        }
+    }
+
+    /* add sibling NP containers */
+    if (parent) {
+        if ((err_info = sr_lyd_create_np_cont_r(NULL, parent, NULL, LYS_CONFIG_R | LYS_CONFIG_W, diff))) {
+            return err_info;
+        }
+    } else {
+        if ((err_info = sr_lyd_create_np_cont_r(first, NULL, ly_mod, LYS_CONFIG_R | LYS_CONFIG_W, diff))) {
             return err_info;
         }
     }
@@ -3248,22 +4034,99 @@ sr_lyd_copy_np_cont_r(struct lyd_node **trg_sibling, struct lyd_node *trg_parent
 }
 
 sr_error_info_t *
-sr_lyd_xpath_dup(const struct lyd_node *data, char **xpaths, uint16_t xp_count, const struct lys_module *cont_ly_mod,
+sr_lyd_dup_module_np_cont(const struct lyd_node *data, const struct lys_module *ly_mod, int add_state_np_conts,
         struct lyd_node **new_data)
 {
     sr_error_info_t *err_info = NULL;
-    struct lyd_node *root, *src;
-    struct ly_set *cur_set, *set = NULL;
-    size_t i;
+    struct lyd_node *root, *next, *elem;
 
-    *new_data = NULL;
+    assert(ly_mod && new_data);
 
-    if (cont_ly_mod) {
-        /* duplicate top-level NP-containers */
-        if ((err_info = sr_lyd_copy_np_cont_r(new_data, NULL, data, cont_ly_mod))) {
-            return err_info;
+    /* copy top-level config NP containers */
+    if ((err_info = sr_lyd_copy_config_np_cont_r(new_data, NULL, data, ly_mod))) {
+        return err_info;
+    }
+
+    if (!add_state_np_conts) {
+        /* done */
+        return NULL;
+    }
+
+    /* add any state NP containers into the config NP containers */
+    LY_TREE_FOR(*new_data, root) {
+        if (lyd_node_module(root) != ly_mod) {
+            continue;
+        }
+
+        LY_TREE_DFS_BEGIN(root, next, elem) {
+            if ((err_info = sr_lyd_create_np_cont_r(NULL, elem, NULL, LYS_CONFIG_R, NULL))) {
+                return err_info;
+            }
+            LY_TREE_DFS_END(root, next, elem);
         }
     }
+
+    /* finally, add top-level state NP containers */
+    if ((err_info = sr_lyd_create_np_cont_r(new_data, NULL, ly_mod, LYS_CONFIG_R, NULL))) {
+        return err_info;
+    }
+
+    return NULL;
+}
+
+sr_error_info_t *
+sr_lyd_dup_module_data(const struct lyd_node *data, const struct lys_module *ly_mod, int add_state_np_conts,
+        struct lyd_node **new_data)
+{
+    sr_error_info_t *err_info = NULL;
+    struct lyd_node *dup, *next, *elem;
+    const struct lyd_node *node;
+
+    assert(ly_mod && new_data);
+
+    LY_TREE_FOR(data, node) {
+        if (lyd_node_module(node) == ly_mod) {
+            /* duplicate node */
+            dup = lyd_dup(node, LYD_DUP_OPT_RECURSIVE | LYD_DUP_OPT_WITH_WHEN);
+            if (!dup) {
+                sr_errinfo_new_ly(&err_info, ly_mod->ctx);
+                return err_info;
+            }
+
+            if (add_state_np_conts) {
+                /* add any nested state NP containers */
+                LY_TREE_DFS_BEGIN(dup, next, elem) {
+                    if ((err_info = sr_lyd_create_np_cont_r(NULL, elem, NULL, LYS_CONFIG_R, NULL))) {
+                        return err_info;
+                    }
+                    LY_TREE_DFS_END(dup, next, elem);
+                }
+            }
+
+            /* connect it to any other data */
+            if (*new_data) {
+                if (lyd_merge(*new_data, dup, LYD_OPT_DESTRUCT | LYD_OPT_EXPLICIT)) {
+                    lyd_free_withsiblings(dup);
+                    sr_errinfo_new_ly(&err_info, ly_mod->ctx);
+                    return err_info;
+                }
+            } else {
+                *new_data = dup;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+sr_error_info_t *
+sr_lyd_dup_enabled_xpath(const struct lyd_node *data, char **xpaths, uint16_t xp_count, struct lyd_node **new_data)
+{
+    sr_error_info_t *err_info = NULL;
+    struct lyd_node *root, *next, *elem;
+    const struct lyd_node *src;
+    struct ly_set *cur_set, *set = NULL;
+    size_t i;
 
     if (!xp_count) {
         /* no XPaths */
@@ -3275,7 +4138,7 @@ sr_lyd_xpath_dup(const struct lyd_node *data, char **xpaths, uint16_t xp_count, 
         cur_set = lyd_find_path(data, xpaths[i]);
         if (!cur_set) {
             sr_errinfo_new_ly(&err_info, lyd_node_module(data)->ctx);
-            goto error;
+            goto cleanup;
         }
 
         /* merge into one set */
@@ -3283,7 +4146,7 @@ sr_lyd_xpath_dup(const struct lyd_node *data, char **xpaths, uint16_t xp_count, 
             if (ly_set_merge(set, cur_set, 0) == -1) {
                 ly_set_free(cur_set);
                 sr_errinfo_new_ly(&err_info, lyd_node_module(data)->ctx);
-                goto error;
+                goto cleanup;
             }
         } else {
             set = cur_set;
@@ -3293,22 +4156,31 @@ sr_lyd_xpath_dup(const struct lyd_node *data, char **xpaths, uint16_t xp_count, 
     for (i = 0; i < set->number; ++i) {
         /* duplicate filtered subtree */
         src = set->set.d[i];
-        root = lyd_dup(src, LYD_DUP_OPT_RECURSIVE | LYD_DUP_OPT_WITH_PARENTS);
+        root = lyd_dup(src, LYD_DUP_OPT_RECURSIVE | LYD_DUP_OPT_WITH_PARENTS | LYD_DUP_OPT_WITH_WHEN);
         if (!root) {
             sr_errinfo_new_ly(&err_info, lyd_node_module(data)->ctx);
-            goto error;
+            goto cleanup;
         }
 
-        /* go top-level and add any existing NP containers along the way */
-        while (1) {
-            if (cont_ly_mod && (err_info = sr_lyd_copy_np_cont_r(&root, root->parent, src, cont_ly_mod))) {
-                return err_info;
+        /* first add any nested state NP containers */
+        LY_TREE_DFS_BEGIN(root, next, elem) {
+            if ((err_info = sr_lyd_create_np_cont_r(NULL, elem, NULL, LYS_CONFIG_R, NULL))) {
+                goto cleanup;
+            }
+            LY_TREE_DFS_END(root, next, elem);
+        }
+
+        /* then go top-level and copy/add any config/state NP containers along the way */
+        while (root->parent) {
+            root = root->parent;
+            if ((err_info = sr_lyd_copy_config_np_cont_r(NULL, root, src, lyd_node_module(set->set.d[i])))) {
+                goto cleanup;
+            }
+            if ((err_info = sr_lyd_create_np_cont_r(NULL, root, NULL, LYS_CONFIG_R, NULL))) {
+                goto cleanup;
             }
 
-            if (!root->parent) {
-                break;
-            }
-            root = root->parent;
+            /* src should be a sibling, not parent (so move it afterwards) */
             src = src->parent;
         }
 
@@ -3317,20 +4189,15 @@ sr_lyd_xpath_dup(const struct lyd_node *data, char **xpaths, uint16_t xp_count, 
             if (lyd_merge(*new_data, root, LYD_OPT_DESTRUCT | LYD_OPT_EXPLICIT)) {
                 lyd_free_withsiblings(root);
                 sr_errinfo_new_ly(&err_info, lyd_node_module(data)->ctx);
-                goto error;
+                goto cleanup;
             }
         } else {
             *new_data = root;
         }
     }
 
+cleanup:
     ly_set_free(set);
-    return NULL;
-
-error:
-    ly_set_free(set);
-    lyd_free_withsiblings(*new_data);
-    *new_data = NULL;
     return err_info;
 }
 
@@ -3367,7 +4234,7 @@ sr_lyd_xpath_complement(struct lyd_node **data, const char *xpath)
     /* store the depth of every node */
     max_depth = 1;
     for (i = 0; i < node_set->number; ++i) {
-        for (parent = node_set->set.d[i], depth = 0; parent; parent = parent->parent, ++depth);
+        for (parent = node_set->set.d[i], depth = 0; parent; parent = parent->parent, ++depth) {}
 
         if (ly_set_add(depth_set, (void *)((uintptr_t)depth), LY_SET_OPT_USEASLIST) == -1) {
             sr_errinfo_new_ly(&err_info, ctx);
@@ -3709,6 +4576,29 @@ sr_xpath_first_node_with_predicates(const char *xpath)
     return strndup(xpath, ptr - xpath);
 }
 
+/**
+ * @brief Parse "..", "*", ".", or a YANG identifier.
+ *
+ * @param[in] id Identifier start.
+ * @return Pointer to the first non-identifier character.
+ */
+static const char *
+sr_xpath_next_identifier(const char *id)
+{
+    if (!strncmp(id, "..", 2)) {
+        id += 2;
+    } else if ((id[0] == '*') || (id[0] == '.')) {
+        id += 1;
+    } else {
+        /* must be valid name so we can ignore special first character rules */
+        while (isalpha(id[0]) || isdigit(id[0]) || (id[0] == '_') || (id[0] == '-') || (id[0] == '.')) {
+            ++id;
+        }
+    }
+
+    return id;
+}
+
 const char *
 sr_xpath_next_name(const char *xpath, const char **mod, int *mod_len, const char **name, int *len, int *double_slash,
         int *has_predicate)
@@ -3716,37 +4606,62 @@ sr_xpath_next_name(const char *xpath, const char **mod, int *mod_len, const char
     const char *ptr;
 
     assert(xpath && (xpath[0] == '/'));
-    *mod = NULL;
-    *mod_len = 0;
-    *name = NULL;
-    *len = 0;
-    *double_slash = 0;
+
+    if (mod) {
+        *mod = NULL;
+    }
+    if (mod_len) {
+        *mod_len = 0;
+    }
+    if (name) {
+        *name = NULL;
+    }
+    if (len) {
+        *len = 0;
+    }
+    if (double_slash) {
+        *double_slash = 0;
+    }
     *has_predicate = 0;
 
     ++xpath;
     if (xpath[0] == '/') {
         ++xpath;
-        *double_slash = 1;
+        if (double_slash) {
+            *double_slash = 1;
+        }
     }
 
-    ptr = xpath;
-    while (ptr[0] && (ptr[0] != '/')) {
-        if (ptr[0] == ':') {
+    /* module/node name */
+    ptr = sr_xpath_next_identifier(xpath);
+
+    /* it was actually module name */
+    if (ptr[0] == ':') {
+        if (mod) {
             *mod = xpath;
+        }
+        if (mod_len) {
             *mod_len = ptr - xpath;
-            xpath = ptr + 1;
         }
-        ++ptr;
-        if (ptr[0] == '[') {
-            *has_predicate = 1;
-            break;
-        }
+        xpath = ptr + 1;
+
+        /* node name */
+        ptr = sr_xpath_next_identifier(xpath);
     }
 
-    *name = xpath;
-    *len = ptr - xpath;
+    /* predicate follows node name */
+    if (ptr[0] == '[') {
+        *has_predicate = 1;
+    }
 
-    return xpath + *len;
+    if (name) {
+        *name = xpath;
+    }
+    if (len) {
+        *len = ptr - xpath;
+    }
+
+    return ptr;
 }
 
 const char *
@@ -3914,18 +4829,14 @@ retry_open:
     if (ds == SR_DS_STARTUP) {
         err_info = sr_path_startup_file(ly_mod->name, &path);
     } else {
-        err_info = sr_path_ds_shm(ly_mod->name, ds, 0, &path);
+        err_info = sr_path_ds_shm(ly_mod->name, ds, &path);
     }
     if (err_info) {
         goto error;
     }
 
     /* open fd */
-    if (ds == SR_DS_STARTUP) {
-        fd = open(path, O_RDONLY);
-    } else {
-        fd = shm_open(path, O_RDONLY, 0);
-    }
+    fd = SR_OPEN(path, O_RDONLY, 0);
     if (fd == -1) {
         if ((errno == ENOENT) && (ds == SR_DS_CANDIDATE)) {
             /* no candidate exists, just use running */
@@ -3978,13 +4889,63 @@ error:
 }
 
 sr_error_info_t *
-sr_module_file_data_set(const char *mod_name, sr_datastore_t ds, struct lyd_node *mod_data, int create_flags,
-        mode_t create_mode)
+sr_module_file_oper_data_load(struct sr_mod_info_mod_s *mod, struct lyd_node **diff)
 {
     sr_error_info_t *err_info = NULL;
-    char *path = NULL;
-    int fd = -1;
+    struct lyd_node *root, *next, *elem;
+    struct lyd_attr *attr;
+    sr_cid_t dead_cid = 0;
+
+    assert(!*diff);
+
+    /* load the operational data (diff) */
+    if ((err_info = sr_module_file_data_append(mod->ly_mod, SR_DS_OPERATIONAL, diff))) {
+        return err_info;
+    }
+
+trim_retry:
+    if (dead_cid) {
+        /* this connection is dead, remove its stored diff */
+        SR_LOG_INF("Recovering stored operational data of CID %" PRIu32 ".", dead_cid);
+        if ((err_info = sr_diff_del_conn(diff, dead_cid))) {
+            return err_info;
+        }
+    }
+
+    /* find diff belonging to a dead connection, if any */
+    LY_TREE_FOR(*diff, root) {
+        LY_TREE_DFS_BEGIN(root, next, elem) {
+            LY_TREE_FOR(elem->attr, attr) {
+                if (!strcmp(attr->annotation->module->name, SR_YANG_MOD) && !strcmp(attr->name, "cid")) {
+                    if (!sr_conn_is_alive(attr->value.uint32)) {
+                        dead_cid = attr->value.uint32;
+
+                        /* retry the whole check until there are no dead connections */
+                        goto trim_retry;
+                    }
+                    break;
+                }
+            }
+            LY_TREE_DFS_END(root, next, elem);
+        }
+    }
+
+    return err_info;
+}
+
+sr_error_info_t *
+sr_module_file_data_set(const char *mod_name, sr_datastore_t ds, struct lyd_node *mod_data, int create_flags,
+        mode_t file_mode)
+{
+    sr_error_info_t *err_info = NULL;
+    char *path = NULL, *bck_path = NULL;
+    int fd = -1, backup = 0;
     mode_t um;
+
+    assert(file_mode);
+
+    /* set umask so that the correct permissions are really set */
+    um = umask(SR_UMASK);
 
     /* learn path */
     switch (ds) {
@@ -3994,24 +4955,30 @@ sr_module_file_data_set(const char *mod_name, sr_datastore_t ds, struct lyd_node
     case SR_DS_RUNNING:
     case SR_DS_CANDIDATE:
     case SR_DS_OPERATIONAL:
-        err_info = sr_path_ds_shm(mod_name, ds, 0, &path);
+        err_info = sr_path_ds_shm(mod_name, ds, &path);
         break;
     }
     if (err_info) {
         goto cleanup;
     }
 
-    /* set umask so that the correct permissions are really set if the file is created */
-    um = umask(00000);
+    if ((ds == SR_DS_STARTUP) && (!(create_flags & O_CREAT) && !(create_flags & O_EXCL))) {
+        /* generate the backup path */
+        if (asprintf(&bck_path, "%s%s", path, SR_FILE_BACKUP_SUFFIX) == -1) {
+            SR_ERRINFO_MEM(&err_info);
+            goto cleanup;
+        }
 
-    /* open */
-    if (ds == SR_DS_STARTUP) {
-        fd = open(path, O_WRONLY | O_TRUNC | create_flags, create_mode);
-    } else {
-        fd = shm_open(path, O_WRONLY | O_TRUNC | create_flags, create_mode);
+        /* back up any existing file */
+        if ((err_info = sr_cp_path(bck_path, path, file_mode))) {
+            goto cleanup;
+        }
+
+        backup = 1;
     }
-    umask(um);
-    if (fd == -1) {
+
+    /* open the file */
+    if ((fd = SR_OPEN(path, O_WRONLY | create_flags, file_mode)) == -1) {
         sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Failed to open \"%s\" (%s).", path, strerror(errno));
         goto cleanup;
     }
@@ -4023,11 +4990,19 @@ sr_module_file_data_set(const char *mod_name, sr_datastore_t ds, struct lyd_node
         goto cleanup;
     }
 
+    /* delete the backup file */
+    if (backup && (unlink(bck_path) == -1)) {
+        sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Failed to remove backup \"%s\" (%s).", bck_path, strerror(errno));
+        goto cleanup;
+    }
+
 cleanup:
     if (fd > -1) {
         close(fd);
     }
+    umask(um);
     free(path);
+    free(bck_path);
     return err_info;
 }
 
@@ -4037,6 +5012,7 @@ sr_module_update_oper_diff(sr_conn_ctx_t *conn, const char *mod_name)
     sr_error_info_t *err_info = NULL;
     const struct lys_module *ly_mod;
     struct sr_mod_info_s mod_info;
+    struct ly_set mod_set = {0};
     sr_sid_t sid;
     struct lyd_node *diff = NULL;
 
@@ -4047,27 +5023,19 @@ sr_module_update_oper_diff(sr_conn_ctx_t *conn, const char *mod_name)
     ly_mod = ly_ctx_get_module(conn->ly_ctx, mod_name, NULL, 1);
     SR_CHECK_INT_RET(!ly_mod, err_info);
 
+    /* add the module into mod_info and load its enabled running data */
+    ly_set_add(&mod_set, (void *)ly_mod, 0);
+    if ((err_info = sr_modinfo_add_modules(&mod_info, &mod_set, 0, SR_LOCK_WRITE, SR_MI_PERM_NO | SR_MI_DATA_CACHE,
+            sid, NULL, 0, SR_OPER_NO_STORED | SR_OPER_NO_SUBS))) {
+        goto cleanup;
+    }
+
     /* load the stored diff */
-    if ((err_info = sr_module_file_data_append(ly_mod, SR_DS_OPERATIONAL, &diff))) {
-        return err_info;
+    if ((err_info = sr_module_file_oper_data_load(&mod_info.mods[0], &diff))) {
+        goto cleanup;
     }
     if (!diff) {
         /* no stored diff */
-        return NULL;
-    }
-
-    if ((err_info = sr_shmmod_modinfo_collect_modules(&mod_info, ly_mod, 0))) {
-        goto cleanup;
-    }
-
-    /* MODULES WRITE LOCK */
-    if ((err_info = sr_shmmod_modinfo_wrlock(&mod_info, sid))) {
-        goto cleanup;
-    }
-
-    /* load the module enabled running data */
-    if ((err_info = sr_modinfo_data_load(&mod_info, MOD_INFO_TYPE_MASK, 1, NULL, NULL, 0,
-            SR_OPER_NO_STORED | SR_OPER_NO_SUBS, NULL))) {
         goto cleanup;
     }
 
@@ -4075,15 +5043,16 @@ sr_module_update_oper_diff(sr_conn_ctx_t *conn, const char *mod_name)
     if ((err_info = sr_diff_mod_update(&diff, ly_mod, mod_info.data))) {
         goto cleanup;
     }
-    if ((err_info = sr_module_file_data_set(ly_mod->name, SR_DS_OPERATIONAL, diff, 0, 0))) {
+    if ((err_info = sr_module_file_data_set(ly_mod->name, SR_DS_OPERATIONAL, diff, 0, SR_FILE_PERM))) {
         goto cleanup;
     }
 
 cleanup:
     /* MODULES UNLOCK */
-    sr_shmmod_modinfo_unlock(&mod_info, 0);
+    sr_shmmod_modinfo_unlock(&mod_info, sid);
 
     lyd_free_withsiblings(diff);
+    ly_set_clean(&mod_set);
     sr_modinfo_free(&mod_info);
     return err_info;
 }
@@ -4138,4 +5107,204 @@ sr_lys_next_feature(struct lys_feature *last, const struct lys_module *ly_mod, u
     }
 
     return last;
+}
+
+sr_error_info_t *
+sr_conn_info(sr_cid_t **cids, pid_t **pids, uint32_t *count, sr_cid_t **dead_cids, uint32_t *dead_count)
+{
+    sr_error_info_t *err_info = NULL;
+    char *path = NULL, *ptr;
+    DIR *dir = NULL;
+    struct dirent *ent;
+    sr_cid_t cid;
+    int alive;
+    pid_t pid;
+
+    assert((!cids && !pids) || count);
+    assert(!dead_cids || dead_count);
+    if (cids) {
+        *cids = NULL;
+    }
+    if (pids) {
+        *pids = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (dead_cids) {
+        *dead_cids = NULL;
+        *dead_count = 0;
+    }
+
+    /* get the path to the directory with all the lock files */
+    if ((err_info = sr_path_conn_lockfile(0, &path))) {
+        return err_info;
+    }
+
+    /* open directory */
+    if (!(dir = opendir(path))) {
+        if (errno == ENOENT) {
+            /* no connections for sure */
+            goto cleanup;
+        }
+
+        sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Opening directory \"%s\" failed (%s).", path, strerror(errno));
+        goto cleanup;
+    }
+
+    errno = 0;
+    while ((ent = readdir(dir))) {
+        /* skip irrelevant files */
+        if (strncmp(ent->d_name, "conn_", 5) || strncmp(ent->d_name + strlen(ent->d_name) - 5, ".lock", 5)) {
+            continue;
+        }
+
+        /* get the CID */
+        cid = strtoul(ent->d_name + 5, &ptr, 10);
+        if (!cid || (ptr[0] != '.')) {
+            SR_LOG_WRN("Invalid connection lock file name \"%s\"!", ent->d_name);
+            continue;
+        }
+
+        /* check whether the connection is alive */
+        if ((err_info = sr_shmmain_conn_check(cid, &alive, &pid))) {
+            goto cleanup;
+        }
+
+        /* another live connection */
+        if (alive && (cids || pids || count)) {
+            if (cids) {
+                *cids = sr_realloc(*cids, (*count + 1) * sizeof **cids);
+                SR_CHECK_MEM_GOTO(!*cids, err_info, cleanup);
+                (*cids)[*count] = cid;
+            }
+            if (pids) {
+                *pids = sr_realloc(*pids, (*count + 1) * sizeof **pids);
+                SR_CHECK_MEM_GOTO(!*pids, err_info, cleanup);
+                (*pids)[*count] = pid;
+            }
+            ++(*count);
+        } else if (!alive && dead_cids) {
+            *dead_cids = sr_realloc(*dead_cids, (*dead_count) * sizeof **dead_cids);
+            SR_CHECK_MEM_GOTO(!*dead_cids, err_info, cleanup);
+            (*dead_cids)[*dead_count] = cid;
+            ++(*dead_count);
+        }
+
+        errno = 0;
+    }
+    if (errno) {
+        SR_ERRINFO_SYSERRNO(&err_info, "readdir");
+        goto cleanup;
+    }
+
+    /* success */
+
+cleanup:
+    if (dir) {
+        closedir(dir);
+    }
+    free(path);
+    if (err_info) {
+        if (cids) {
+            free(*cids);
+            *cids = NULL;
+        }
+        if (pids) {
+            free(*pids);
+            *pids = NULL;
+        }
+        *count = 0;
+    }
+    return err_info;
+}
+
+sr_error_info_t *
+sr_time2datetime(time_t time, const char *tz, char *buf, char **buf2)
+{
+    sr_error_info_t *err_info = NULL;
+    char *zoneshift = NULL;
+    int zonediff, zonediff_h, zonediff_m;
+    struct tm tm, *tm_ret;
+    char *tz_origin;
+
+    assert(buf || buf2);
+
+    if (tz) {
+        tz_origin = getenv("TZ");
+        if (tz_origin) {
+            tz_origin = strdup(tz_origin);
+            if (!tz_origin) {
+                SR_ERRINFO_MEM(&err_info);
+                return err_info;
+            }
+        }
+        setenv("TZ", tz, 1);
+        tzset(); /* apply timezone change */
+        tm_ret = localtime_r(&time, &tm);
+        if (tz_origin) {
+            setenv("TZ", tz_origin, 1);
+            free(tz_origin);
+        } else {
+            unsetenv("TZ");
+        }
+        tzset(); /* apply timezone change */
+
+        if (!tm_ret) {
+            SR_ERRINFO_SYSERRNO(&err_info, "localtime_r");
+            return err_info;
+        }
+    } else {
+        if (!gmtime_r(&time, &tm)) {
+            SR_ERRINFO_SYSERRNO(&err_info, "gmtime_r");
+            return err_info;
+        }
+    }
+
+    /* years cannot be negative */
+    if (tm.tm_year < -1900) {
+        SR_ERRINFO_INT(&err_info);
+        return err_info;
+    }
+
+    if (tm.tm_gmtoff == 0) {
+        /* time is Zulu (UTC) */
+        if (asprintf(&zoneshift, "Z") == -1) {
+            SR_ERRINFO_MEM(&err_info);
+            return err_info;
+        }
+    } else {
+        zonediff = tm.tm_gmtoff;
+        zonediff_h = zonediff / 60 / 60;
+        zonediff_m = zonediff / 60 % 60;
+        if (asprintf(&zoneshift, "%+03d:%02d", zonediff_h, zonediff_m) == -1) {
+            SR_ERRINFO_MEM(&err_info);
+            return err_info;
+        }
+    }
+
+    if (buf) {
+        sprintf(buf, "%04d-%02d-%02dT%02d:%02d:%02d%s",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec,
+                zoneshift);
+    } else if (asprintf(buf2, "%04d-%02d-%02dT%02d:%02d:%02d%s",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+            zoneshift) == -1) {
+        free(zoneshift);
+        SR_ERRINFO_MEM(&err_info);
+        return err_info;
+    }
+    free(zoneshift);
+
+    return NULL;
 }

@@ -21,18 +21,18 @@
  */
 #include "common.h"
 
-#include <stdlib.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/uio.h>
+#include <assert.h>
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
-#include <dirent.h>
+#include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/uio.h>
 #include <time.h>
-#include <assert.h>
+#include <unistd.h>
 
 /**
  * @brief Wrapper for writev().
@@ -147,9 +147,9 @@ sr_replay_open_file(const char *mod_name, time_t from_ts, time_t to_ts, int flag
     }
 
     /* set umask so that the correct permissions are really set */
-    um = umask(00000);
+    um = umask(SR_UMASK);
 
-    *notif_fd = open(path, flags, perm);
+    *notif_fd = SR_OPEN(path, flags, perm);
     umask(um);
     if (*notif_fd == -1) {
         sr_errinfo_new(&err_info, SR_ERR_SYS, NULL, "Failed to open file \"%s\" (%s).", path, strerror(errno));
@@ -359,10 +359,11 @@ cleanup:
  * @param[in] shm_mod Notification SHM module.
  * @param[in] notif_lyb Notification in LYB format, is spent!
  * @param[in] notif_ts Notification timestamp.
+ * @param[in] cid Connection ID.
  * @return err_info, NULL on success.
  */
 static sr_error_info_t *
-sr_notif_write(const struct lys_module *ly_mod, sr_mod_t *shm_mod, char *notif_lyb, time_t notif_ts)
+sr_notif_write(const struct lys_module *ly_mod, sr_mod_t *shm_mod, char *notif_lyb, time_t notif_ts, sr_cid_t cid)
 {
     sr_error_info_t *err_info = NULL;
     time_t from_ts, to_ts;
@@ -374,7 +375,7 @@ sr_notif_write(const struct lys_module *ly_mod, sr_mod_t *shm_mod, char *notif_l
     SR_CHECK_INT_GOTO(notif_lyb_len == -1, err_info, cleanup);
 
     /* REPLAY WRITE LOCK */
-    if ((err_info = sr_rwlock(&shm_mod->replay_lock, SR_MOD_LOCK_TIMEOUT, SR_LOCK_WRITE, __func__))) {
+    if ((err_info = sr_rwlock(&shm_mod->replay_lock, SR_MOD_LOCK_TIMEOUT, SR_LOCK_WRITE, cid, __func__, NULL, NULL))) {
         goto cleanup;
     }
 
@@ -428,7 +429,7 @@ sr_notif_write(const struct lys_module *ly_mod, sr_mod_t *shm_mod, char *notif_l
 
 cleanup_unlock:
     /* REPLAY WRITE UNLOCK */
-    sr_rwunlock(&shm_mod->replay_lock, SR_LOCK_WRITE, __func__);
+    sr_rwunlock(&shm_mod->replay_lock, SR_MOD_LOCK_TIMEOUT, SR_LOCK_WRITE, cid, __func__);
 cleanup:
     if (fd > -1) {
         close(fd);
@@ -520,10 +521,10 @@ sr_replay_store(sr_session_ctx_t *sess, const struct lyd_node *notif, time_t not
     SR_CHECK_INT_RET(notif_op->schema->nodetype != LYS_NOTIF, err_info);
 
     /* find SHM mod for replay lock and check if replay is even supported */
-    shm_mod = sr_shmmain_find_module(&sess->conn->main_shm, sess->conn->ext_shm.addr, ly_mod->name, 0);
+    shm_mod = sr_shmmain_find_module(SR_CONN_MAIN_SHM(sess->conn), ly_mod->name);
     SR_CHECK_INT_RET(!shm_mod, err_info);
 
-    if (!(shm_mod->flags & SR_MOD_REPLAY_SUPPORT)) {
+    if (!ATOMIC_LOAD_RELAXED(shm_mod->replay_supp)) {
         /* nothing to do */
         return NULL;
     }
@@ -543,7 +544,7 @@ sr_replay_store(sr_session_ctx_t *sess, const struct lyd_node *notif, time_t not
         SR_LOG_INF("Notification \"%s\" buffered to be stored for replay.", notif_op->schema->name);
     } else {
         /* write the notification to a replay file */
-        if ((err_info = sr_notif_write(ly_mod, shm_mod, notif_lyb, notif_ts))) {
+        if ((err_info = sr_notif_write(ly_mod, shm_mod, notif_lyb, notif_ts, sess->conn->cid))) {
             return err_info;
         }
         SR_LOG_INF("Notification \"%s\" stored for replay.", notif_op->schema->name);
@@ -596,14 +597,14 @@ sr_notif_buf_thread(void *arg)
 
         while (first) {
             /* find SHM mod */
-            shm_mod = sr_shmmain_find_module(&sess->conn->main_shm, sess->conn->ext_shm.addr, first->notif_mod->name, 0);
+            shm_mod = sr_shmmain_find_module(SR_CONN_MAIN_SHM(sess->conn), first->notif_mod->name);
             if (!shm_mod) {
                 SR_ERRINFO_INT(&err_info);
                 break;
             }
 
             /* store the notification, continue normally on error (notif_lyb is spent!) */
-            err_info = sr_notif_write(first->notif_mod, shm_mod, first->notif_lyb, first->notif_ts);
+            err_info = sr_notif_write(first->notif_mod, shm_mod, first->notif_lyb, first->notif_ts, sess->conn->cid);
             sr_errinfo_free(&err_info);
 
             /* next iter */
@@ -713,10 +714,10 @@ sr_replay_notify(sr_conn_ctx_t *conn, const char *mod_name, const char *xpath, t
     sr_sid_t sid = {0};
 
     /* find SHM mod for replay lock and check if replay is even supported */
-    shm_mod = sr_shmmain_find_module(&conn->main_shm, conn->ext_shm.addr, mod_name, 0);
+    shm_mod = sr_shmmain_find_module(SR_CONN_MAIN_SHM(conn), mod_name);
     SR_CHECK_INT_GOTO(!shm_mod, err_info, cleanup);
 
-    if (!(shm_mod->flags & SR_MOD_REPLAY_SUPPORT)) {
+    if (!ATOMIC_LOAD_RELAXED(shm_mod->replay_supp)) {
         /* nothing to do */
         SR_LOG_WRN("Module \"%s\" does not support notification replay.", mod_name);
         goto cleanup;

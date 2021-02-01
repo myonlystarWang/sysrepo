@@ -69,6 +69,18 @@ setup_f(void **state)
     if (sr_install_module(st->conn, TESTS_DIR "/files/decimal.yang", TESTS_DIR "/files", NULL, 0) != SR_ERR_OK) {
         return 1;
     }
+    if (sr_install_module(st->conn, TESTS_DIR "/files/referenced-data.yang", TESTS_DIR "/files", NULL, 0) != SR_ERR_OK) {
+        return 1;
+    }
+    if (sr_install_module(st->conn, TESTS_DIR "/files/test-module.yang", TESTS_DIR "/files", NULL, 0) != SR_ERR_OK) {
+        return 1;
+    }
+    if (sr_install_module(st->conn, TESTS_DIR "/files/ops-ref.yang", TESTS_DIR "/files", NULL, 0) != SR_ERR_OK) {
+        return 1;
+    }
+    if (sr_install_module(st->conn, TESTS_DIR "/files/ops.yang", TESTS_DIR "/files", NULL, 0) != SR_ERR_OK) {
+        return 1;
+    }
     sr_disconnect(st->conn);
 
     if (sr_connect(0, &(st->conn)) != SR_ERR_OK) {
@@ -91,6 +103,10 @@ teardown_f(void **state)
     sr_remove_module(st->conn, "ietf-interfaces");
     sr_remove_module(st->conn, "iana-if-type");
     sr_remove_module(st->conn, "test");
+    sr_remove_module(st->conn, "test-module");
+    sr_remove_module(st->conn, "referenced-data");
+    sr_remove_module(st->conn, "ops");
+    sr_remove_module(st->conn, "ops-ref");
 
     sr_disconnect(st->conn);
     free(st);
@@ -103,7 +119,7 @@ clear_interfaces(void **state)
     struct state *st = (struct state *)*state;
 
     sr_delete_item(st->sess, "/ietf-interfaces:interfaces", 0);
-    sr_apply_changes(st->sess, 0, 0);
+    sr_apply_changes(st->sess, 0, 1);
 
     return 0;
 }
@@ -116,7 +132,8 @@ clear_test(void **state)
     sr_delete_item(st->sess, "/test:l1", 0);
     sr_delete_item(st->sess, "/test:ll1", 0);
     sr_delete_item(st->sess, "/test:cont", 0);
-    sr_apply_changes(st->sess, 0, 0);
+    sr_delete_item(st->sess, "/test:l3", 0);
+    sr_apply_changes(st->sess, 0, 1);
 
     return 0;
 }
@@ -126,6 +143,14 @@ test_edit_item(void **state)
 {
     struct state *st = (struct state *)*state;
     int ret;
+
+    /* invalid xpath */
+    ret = sr_set_item_str(st->sess, "//test:cont/ll2", "15", NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_INVAL_ARG);
+
+    /* non-existing xpath */
+    ret = sr_set_item_str(st->sess, "/test:cont/no", "15", NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_INVAL_ARG);
 
     /* same edits are ignored */
     ret = sr_delete_item(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']", 0);
@@ -148,6 +173,18 @@ test_edit_item(void **state)
     assert_int_equal(ret, SR_ERR_INVAL_ARG);
     ret = sr_discard_changes(st->sess);
     assert_int_equal(ret, SR_ERR_OK);
+
+    /* whole edit should be removed */
+    ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/type",
+            "iana-if-type:ethernetCsmacd", NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/enabled",
+            "false", NULL, 0);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_move_item(st->sess, "/ietf-interfaces:interfaces/interface[name='eth2']",
+            SR_MOVE_FIRST, NULL, NULL, NULL, 0);
+    assert_int_equal(ret, SR_ERR_OPERATION_FAILED);
+    assert_false(sr_has_changes(st->sess));
 }
 
 static void
@@ -163,13 +200,13 @@ test_delete(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_delete_item(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/type", 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* delete on no data */
     ret = sr_delete_item(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/type", SR_EDIT_STRICT);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_NOT_FOUND);
     ret = sr_discard_changes(st->sess);
     assert_int_equal(ret, SR_ERR_OK);
@@ -177,12 +214,12 @@ test_delete(void **state)
     /* delete a leaf without exact value */
     ret = sr_set_item_str(st->sess, "/test:test-leaf", "16", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     ret = sr_delete_item(st->sess, "/test:test-leaf", 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* check final datastore contents */
@@ -209,7 +246,7 @@ test_create1(void **state)
     ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/type",
             "iana-if-type:ethernetCsmacd", NULL, SR_EDIT_STRICT);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     ret = sr_get_subtree(st->sess, "/ietf-interfaces:interfaces", 0, &subtree);
@@ -231,14 +268,14 @@ test_create1(void **state)
 
     ret = sr_delete_item(st->sess, "/ietf-interfaces:interfaces", 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* create with non-existing parents */
     ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/type",
             "iana-if-type:ethernetCsmacd", NULL, SR_EDIT_NON_RECURSIVE);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_NOT_FOUND);
     ret = sr_discard_changes(st->sess);
     assert_int_equal(ret, SR_ERR_OK);
@@ -258,7 +295,7 @@ test_create2(void **state)
     ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/type",
             "iana-if-type:ethernetCsmacd", NULL, SR_EDIT_STRICT);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     ret = sr_get_subtree(st->sess, "/ietf-interfaces:interfaces", 0, &subtree);
@@ -280,7 +317,7 @@ test_create2(void **state)
 
     ret = sr_delete_item(st->sess, "/ietf-interfaces:interfaces", 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     ret = sr_get_subtree(st->sess, "/ietf-interfaces:interfaces", 0, &subtree);
@@ -289,6 +326,43 @@ test_create2(void **state)
     lyd_print_mem(&str, subtree, LYD_XML, LYP_WITHSIBLINGS);
     assert_null(str);
     lyd_free(subtree);
+}
+
+static void
+test_create_np_cont(void **state)
+{
+    struct state *st = (struct state *)*state;
+    struct lyd_node *subtree;
+    int ret;
+
+    ret = sr_get_subtree(st->sess, "/ietf-interfaces:interfaces", 0, &subtree);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    assert_string_equal(subtree->schema->name, "interfaces");
+    assert_int_equal(subtree->dflt, 1);
+    lyd_free(subtree);
+
+    ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces", NULL, NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_apply_changes(st->sess, 0, 1);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    ret = sr_get_subtree(st->sess, "/ietf-interfaces:interfaces", 0, &subtree);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    assert_string_equal(subtree->schema->name, "interfaces");
+    assert_int_equal(subtree->dflt, 1);
+    lyd_free(subtree);
+
+    ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces", NULL, NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_apply_changes(st->sess, 0, 1);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces", NULL, NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_apply_changes(st->sess, 0, 1);
+    assert_int_equal(ret, SR_ERR_OK);
 }
 
 static void
@@ -315,19 +389,19 @@ test_move(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_set_item_str(st->sess, "/test:ll1", "-3", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* perform some move operations */
     ret = sr_move_item(st->sess, "/test:l1[k='key3']", SR_MOVE_FIRST, NULL, NULL, NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_move_item(st->sess, "/test:l1[k='key1']", SR_MOVE_AFTER, "[k='key2']", NULL, NULL, 0);
+    ret = sr_move_item(st->sess, "/test:l1[k='key1']", SR_MOVE_AFTER, "[test:k='key2']", NULL, NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_move_item(st->sess, "/test:ll1[.='-3']", SR_MOVE_FIRST, NULL, NULL, NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_move_item(st->sess, "/test:ll1[.='-1']", SR_MOVE_AFTER, NULL, "-2", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     ret = sr_get_data(st->sess, "/test:*", 0, 0, 0, &data);
@@ -394,7 +468,7 @@ test_move(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_set_item_str(st->sess, "/test:cont/ll2", "-3", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* perform some move operations */
@@ -406,7 +480,7 @@ test_move(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_move_item(st->sess, "/test:cont/ll2[.='-3']", SR_MOVE_BEFORE, NULL, "-2", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     ret = sr_get_data(st->sess, "/test:cont", 0, 0, 0, &data);
@@ -444,7 +518,7 @@ test_replace(void **state)
     ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/type",
             "iana-if-type:ethernetCsmacd", NULL, SR_EDIT_STRICT);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* remove and create some other data, internally transformed into replace */
@@ -455,7 +529,7 @@ test_replace(void **state)
     ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth32']/type",
             "iana-if-type:ethernetCsmacd", NULL, SR_EDIT_STRICT);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* check final datastore contents */
@@ -478,6 +552,51 @@ test_replace(void **state)
 }
 
 static void
+test_replace_userord(void **state)
+{
+    struct state *st = (struct state *)*state;
+    struct lyd_node *data, *edit;
+    char *str, *str2;
+    int ret;
+
+    /* create some data */
+    ret = sr_set_item_str(st->sess, "/test:l3[k='one']", NULL, NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_apply_changes(st->sess, 0, 1);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* replace some data with a custom edit */
+    str2 =
+    "<l3 xmlns=\"urn:test\" xmlns:xc=\"urn:ietf:params:xml:ns:netconf:base:1.0\" xc:operation=\"replace\">"
+        "<k>one</k>"
+        "<ll3>3</ll3>"
+    "</l3>";
+    edit = lyd_parse_mem((struct ly_ctx *)sr_get_context(st->conn), str2, LYD_XML, LYD_OPT_EDIT);
+    assert_non_null(edit);
+    ret = sr_edit_batch(st->sess, edit, "merge");
+    lyd_free_withsiblings(edit);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_apply_changes(st->sess, 0, 1);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* check final datastore contents */
+    ret = sr_get_data(st->sess, "/test:*", 0, 0, 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    lyd_print_mem(&str, data, LYD_XML, LYP_WITHSIBLINGS);
+    lyd_free_withsiblings(data);
+
+    str2 =
+    "<l3 xmlns=\"urn:test\">"
+        "<k>one</k>"
+        "<ll3>3</ll3>"
+    "</l3>";
+
+    assert_string_equal(str, str2);
+    free(str);
+}
+
+static void
 test_isolate(void **state)
 {
     struct state *st = (struct state *)*state;
@@ -492,7 +611,7 @@ test_isolate(void **state)
     ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/type",
             "iana-if-type:softwareLoopback", NULL, SR_EDIT_STRICT | SR_EDIT_ISOLATE);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_EXISTS);
 
     ret = sr_discard_changes(st->sess);
@@ -505,7 +624,11 @@ test_isolate(void **state)
     ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth64']/type",
             "iana-if-type:softwareLoopback", NULL, SR_EDIT_ISOLATE);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    /* invalid edit but keeps the previous one */
+    ret = sr_move_item(st->sess, "/ietf-interfaces:interfaces/interface[name='eth32']",
+            SR_MOVE_FIRST, NULL, NULL, NULL, SR_EDIT_ISOLATE);
+    assert_int_equal(ret, SR_ERR_INVAL_ARG);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* check datastore contents */
@@ -539,7 +662,7 @@ test_isolate(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_delete_item(st->sess, "/test:test-leaf", SR_EDIT_STRICT | SR_EDIT_ISOLATE);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* check datastore contents */
@@ -581,13 +704,13 @@ test_purge(void **state)
     ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth67']/type",
             "iana-if-type:ethernetCsmacd", NULL, SR_EDIT_STRICT);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* delete all instances */
     ret = sr_delete_item(st->sess, "/ietf-interfaces:interfaces/interface", 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* check datastore contents */
@@ -603,12 +726,12 @@ test_purge(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_set_item_str(st->sess, "/test:ll1", "14", NULL, SR_EDIT_STRICT);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     ret = sr_delete_item(st->sess, "/test:ll1", 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     ret = sr_get_subtree(st->sess, "/test:ll1", 0, &subtree);
@@ -635,7 +758,7 @@ test_top_op(void **state)
     ret = sr_set_item_str(st->sess, "/ietf-interfaces:interfaces/interface[name='eth65']/type",
             "iana-if-type:ethernetCsmacd", NULL, SR_EDIT_STRICT);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* replace the top-level container with an empty one */
@@ -646,7 +769,7 @@ test_top_op(void **state)
     ret = sr_edit_batch(st->sess, data, "merge");
     lyd_free_withsiblings(data);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* check datastore contents */
@@ -669,13 +792,13 @@ test_union(void **state)
     /* create some host */
     ret = sr_set_item_str(st->sess, "/test:cont/server", "fe80::42:39ff:fe67:1fb3", NULL, SR_EDIT_STRICT);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* change it */
     ret = sr_set_item_str(st->sess, "/test:cont/server", "192.168.1.10", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* check datastore contents */
@@ -794,6 +917,286 @@ test_decimal64(void **state)
     assert_int_equal(ret, SR_ERR_OK);
 }
 
+static void
+test_mutiple_types(void **state)
+{
+    struct state *st = (struct state *)*state;
+    struct lyd_node *data;
+    char *str, *str2;
+    int ret;
+    sr_val_t val;
+
+    /* type string */
+    val.type = SR_STRING_T;
+    val.data.string_val = "string\"\"\'";
+    ret = sr_set_item(st->sess, "/test-module:main/string", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/string", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_string_equal(((struct lyd_node_leaf_list *)data)->value_str, "string\"\"\'");
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type binary */
+    val.type = SR_BINARY_T;
+    val.data.string_val = "VGhpcyBpcyBleGFtcGxlIG1lc3NhZ2Uu";
+    ret = sr_set_item(st->sess, "/test-module:main/raw", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/raw", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_string_equal(((struct lyd_node_leaf_list *)data)->value_str, "VGhpcyBpcyBleGFtcGxlIG1lc3NhZ2Uu");
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type bit */
+    val.type = SR_BITS_T;
+    val.data.string_val = "strict";
+    ret = sr_set_item(st->sess, "/test-module:main/options", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/options", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_string_equal(((struct lyd_node_leaf_list *)data)->value_str, "strict");
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type enum */
+    val.type = SR_ENUM_T;
+    val.data.string_val = "yes";
+    ret = sr_set_item(st->sess, "/test-module:main/enum", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/enum", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_string_equal(((struct lyd_node_leaf_list *)data)->value_str, "yes");
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type identityref */
+    val.type = SR_IDENTITYREF_T;
+    val.data.string_val = "id_1";
+    ret = sr_set_item(st->sess, "/test-module:main/id_ref", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/id_ref", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_string_equal(((struct lyd_node_leaf_list *)data)->value_str, "test-module:id_1");
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type instance-identifier */
+    val.type = SR_INSTANCEID_T;
+    val.data.string_val = "/test-module:main/options";
+    ret = sr_set_item(st->sess, "/test-module:main/instance_id", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_data(st->sess, "/test-module:main/instance_id", 0, 0, 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    lyd_print_mem(&str, data, LYD_XML, 0);
+    asprintf(&str2,
+    "<main xmlns=\"urn:ietf:params:xml:ns:yang:test-module\">"
+        "<instance_id xmlns:tm=\"urn:ietf:params:xml:ns:yang:test-module\">/tm:main/tm:options</instance_id>"
+    "</main>");
+    assert_string_equal(str, str2);
+    free(str);
+    free(str2);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* anydata */
+    val.type = SR_ANYDATA_T;
+    val.data.string_val = "test";
+    ret = sr_set_item(st->sess, "/test-module:main/any-data", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/any-data", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_string_equal(((struct lyd_node_anydata *)data)->value.str, "test");
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type empty */
+    val.type = SR_LEAF_EMPTY_T;
+    ret = sr_set_item(st->sess, "/test-module:main/empty", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/empty", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_string_equal(((struct lyd_node_leaf_list *)data)->value_str, "");
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type boolean */
+    val.type = SR_BOOL_T;
+    val.data.bool_val = 1;
+    ret = sr_set_item(st->sess, "/test-module:main/boolean", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/boolean", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(((struct lyd_node_leaf_list *)data)->value.bln, 1);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type uint8 */
+    val.type = SR_UINT8_T;
+    val.data.uint8_val = UINT8_MAX;
+    ret = sr_set_item(st->sess, "/test-module:main/ui8", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/ui8", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(((struct lyd_node_leaf_list *)data)->value.uint8, UINT8_MAX);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type uint16 */
+    val.type = SR_UINT16_T;
+    val.data.uint16_val = UINT16_MAX;
+    ret = sr_set_item(st->sess, "/test-module:main/ui16", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/ui16", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(((struct lyd_node_leaf_list *)data)->value.uint16, UINT16_MAX);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type uint32 */
+    val.type = SR_UINT32_T;
+    val.data.uint32_val = UINT32_MAX;
+    ret = sr_set_item(st->sess, "/test-module:main/ui32", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/ui32", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(((struct lyd_node_leaf_list *)data)->value.uint32, UINT32_MAX);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type uint64 */
+    val.type = SR_UINT64_T;
+    val.data.uint64_val = UINT64_MAX;
+    ret = sr_set_item(st->sess, "/test-module:main/ui64", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/ui64", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(((struct lyd_node_leaf_list *)data)->value.uint64, UINT64_MAX);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type int8 */
+    val.type = SR_INT8_T;
+    val.data.int8_val = INT8_MAX;
+    ret = sr_set_item(st->sess, "/test-module:main/i8", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/i8", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(((struct lyd_node_leaf_list *)data)->value.int8, INT8_MAX);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type int16 */
+    val.type = SR_INT16_T;
+    val.data.int16_val = INT16_MAX;
+    ret = sr_set_item(st->sess, "/test-module:main/i16", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/i16", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(((struct lyd_node_leaf_list *)data)->value.int16, INT16_MAX);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type int32 */
+    val.type = SR_INT32_T;
+    val.data.int32_val = INT32_MAX;
+    ret = sr_set_item(st->sess, "/test-module:main/i32", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/i32", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(((struct lyd_node_leaf_list *)data)->value.int32, INT32_MAX);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* type int64 */
+    val.type = SR_INT64_T;
+    val.data.int64_val = INT64_MAX;
+    ret = sr_set_item(st->sess, "/test-module:main/i64", &val, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/test-module:main/i64", 0, &data);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(((struct lyd_node_leaf_list *)data)->value.int64, INT64_MAX);
+    lyd_free(data);
+    ret = sr_discard_changes(st->sess);
+    assert_int_equal(ret, SR_ERR_OK);
+}
+
+/* rpc/action/notification node not allowed to be edited */
+static void
+test_edit_forbid_node_types(void **state)
+{
+    struct state *st = (struct state *)*state;
+    struct lyd_node *subtree;
+    char *str;
+    const char *str2;
+    int ret;
+
+    /* set some data needed for validation */
+    ret=sr_set_item_str(st->sess, "/ops:cont/list1[k='key']", NULL, NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_apply_changes(st->sess, 0, 1);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* rpc node cannot be created */
+    ret = sr_set_item_str(st->sess, "/ops:rpc3/l4", "val", NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_INVAL_ARG);
+    ret = sr_apply_changes(st->sess, 0, 1);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/ops:rpc3/l4", 0, &subtree);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_null(subtree);
+
+    /* action node cannot be created */
+    ret = sr_set_item_str(st->sess, "/ops:cont/list1[k='k']/cont2/act1/l6", "val", NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_INVAL_ARG);
+    ret = sr_apply_changes(st->sess, 0, 1);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/ops:cont/list1[k='k']/cont2/act1/l6", 0, &subtree);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_null(subtree);
+
+    /* notification node cannot be created */
+    ret = sr_set_item_str(st->sess, "/ops:notif3/list2[k='k']", NULL, NULL, SR_EDIT_STRICT);
+    assert_int_equal(ret, SR_ERR_INVAL_ARG);
+    ret = sr_apply_changes(st->sess, 0, 1);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_get_subtree(st->sess, "/ops:notif3/list2[k='k']", 0, &subtree);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_null(subtree);
+
+    /* not throw away the whole edit, the successfully created node still exists */
+    ret = sr_get_subtree(st->sess, "/ops:cont", 0, &subtree);
+    assert_int_equal(ret, SR_ERR_OK);
+    lyd_print_mem(&str, subtree, LYD_XML, LYP_WITHSIBLINGS);
+
+    str2 =
+    "<cont xmlns=\"urn:ops\">"
+        "<list1>"
+            "<k>key</k>"
+        "</list1>"
+    "</cont>";
+
+    assert_string_equal(str, str2);
+    lyd_free(subtree);
+    free(str);
+}
+
 int
 main(void)
 {
@@ -802,13 +1205,17 @@ main(void)
         cmocka_unit_test_teardown(test_delete, clear_interfaces),
         cmocka_unit_test_teardown(test_create1, clear_interfaces),
         cmocka_unit_test_teardown(test_create2, clear_interfaces),
+        cmocka_unit_test_teardown(test_create_np_cont, clear_interfaces),
         cmocka_unit_test_teardown(test_move, clear_test),
         cmocka_unit_test_teardown(test_replace, clear_interfaces),
+        cmocka_unit_test_teardown(test_replace_userord, clear_test),
         cmocka_unit_test_teardown(test_isolate, clear_interfaces),
         cmocka_unit_test(test_purge),
         cmocka_unit_test(test_top_op),
         cmocka_unit_test_teardown(test_union, clear_test),
         cmocka_unit_test(test_decimal64),
+        cmocka_unit_test(test_mutiple_types),
+        cmocka_unit_test(test_edit_forbid_node_types),
     };
 
     setenv("CMOCKA_TEST_ABORT", "1", 1);

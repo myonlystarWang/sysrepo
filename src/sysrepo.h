@@ -19,6 +19,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #ifndef _SYSREPO_H
 #define _SYSREPO_H
 
@@ -64,7 +65,7 @@ typedef enum sr_error_e {
     SR_ERR_LOCKED,             /**< Requested resource is already locked. */
     SR_ERR_TIME_OUT,           /**< Time out has expired. */
     SR_ERR_CALLBACK_FAILED,    /**< User callback failure caused the operation to fail. */
-    SR_ERR_CALLBACK_SHELVE,    /**< User callback has not processed the event and will do so
+    SR_ERR_CALLBACK_SHELVE     /**< User callback has not processed the event and will do so
                                     on some future event processing. */
 } sr_error_t;
 
@@ -84,7 +85,7 @@ typedef enum {
     SR_LL_ERR,       /**< Print only error messages. */
     SR_LL_WRN,       /**< Print error and warning messages. */
     SR_LL_INF,       /**< Besides errors and warnings, print some other informational messages. */
-    SR_LL_DBG,       /**< Print all messages including some development debug messages. */
+    SR_LL_DBG        /**< Print all messages including some development debug messages. */
 } sr_log_level_t;
 
 /**
@@ -181,7 +182,7 @@ typedef enum sr_conn_flag_e {
                                          much faster. Affects all sessions created on this connection. */
     SR_CONN_NO_SCHED_CHANGES = 2,   /**< Do not parse internal modules data and apply any scheduled changes. Makes
                                          creating the connection faster but, obviously, scheduled changes are not applied. */
-    SR_CONN_ERR_ON_SCHED_FAIL = 4,  /**< If applying any of the scheduled changes fails, do not create a connection
+    SR_CONN_ERR_ON_SCHED_FAIL = 4   /**< If applying any of the scheduled changes fails, do not create a connection
                                          and return an error. */
 } sr_conn_flag_t;
 
@@ -199,15 +200,15 @@ typedef enum sr_datastore_e {
     SR_DS_STARTUP = 0,     /**< Contains configuration data that will be loaded when a device starts. */
     SR_DS_RUNNING = 1,     /**< Contains current configuration data. */
     SR_DS_CANDIDATE = 2,   /**< Contains prepared configuration data that do not affect actual configuration. */
-    SR_DS_OPERATIONAL = 3, /**< Contains currently used configuration (see [operational datastore](@ref oper_ds)). */
+    SR_DS_OPERATIONAL = 3  /**< Contains currently used configuration (see [operational datastore](@ref oper_ds)). */
 } sr_datastore_t;
 
 /**
  * @brief A single, detailed error message. Used in sr_error_info_s
  */
 typedef struct sr_error_info_msg_s {
-  char *message;   /**< Error message. */
-  char *xpath;     /**< [XPath](@ref paths) (or rather path) to the node where the error has been discovered. */
+    char *message; /**< Error message. */
+    char *xpath;   /**< [XPath](@ref paths) (or rather path) to the node where the error has been discovered. */
 } sr_error_info_msg_t;
 
 /**
@@ -223,8 +224,8 @@ typedef struct sr_error_info_s {
  * @brief Connects to the sysrepo datastore. If possible (no other connections exist), also apply
  * any scheduled changes.
  *
- * @note Do not use `fork()` after creating a connection. Sysrepo internally stores PID of
- * every created connection and this way a mismatch of PID and connection is created.
+ * @note Do not use `fork()` after creating a connection. Sysrepo internally stores the connection
+ * ID of every connection. Forking will duplicate the connection and ID resulting in a mismatch.
  *
  * @param[in] opts Options overriding default connection handling by this call.
  * @param[out] conn Connection that can be used for subsequent API calls
@@ -247,7 +248,7 @@ int sr_connect(const sr_conn_options_t opts, sr_conn_ctx_t **conn);
 int sr_disconnect(sr_conn_ctx_t *conn);
 
 /**
- * @brief Learn the current global number of (some possibly dead) connections.
+ * @brief Learn the current global number of alive connections.
  *
  * @param[out] conn_count Current number of connections.
  * @return Error code (::SR_ERR_OK on success).
@@ -278,7 +279,7 @@ typedef int (*sr_diff_check_cb)(sr_session_ctx_t *session, const struct lyd_node
  * by validation. This callback is primarily meant to allow full NACM
  * (NETCONF Access Control) to be performed by a NETCONF server.
  *
- * Required ROOT access.
+ * Required SUPERUSER access.
  *
  * @param[in] conn Connection, whose all sessions diffs will be passed to this callback.
  * @param[in] callback Callback to call for every diff.
@@ -405,7 +406,7 @@ uint32_t sr_session_get_nc_id(sr_session_ctx_t *session);
 /**
  * @brief Set the effective user of a session to a different one that the process owner.
  *
- * Required ROOT access.
+ * Required SUPERUSER access.
  *
  * @param[in] session Session (not [DS](@ref sr_datastore_t)-specific) to change.
  * @param[in] user System user.
@@ -416,7 +417,7 @@ int sr_session_set_user(sr_session_ctx_t *session, const char *user);
 /**
  * @brief Get the effective user of a session.
  *
- * Required ROOT access.
+ * Required SUPERUSER access.
  *
  * @param[in] session Session (not [DS](@ref sr_datastore_t)-specific) to use.
  * @return Session user.
@@ -471,8 +472,8 @@ int sr_install_module(sr_conn_ctx_t *conn, const char *schema_path, const char *
  *
  * @param[in] conn Connection to use.
  * @param[in] module_name Name of the module to set startup data.
- * @param[in] data Data to set. Must be NULL if \p data_path is set.
- * @param[in] data_path Data file with the data to set. Must be NULL if \p data is set.
+ * @param[in] data Data to set. Must be NULL if @p data_path is set.
+ * @param[in] data_path Data file with the data to set. Must be NULL if @p data is set.
  * @param[in] format Format of the data/file.
  * @return Error code (::SR_ERR_OK on success).
  */
@@ -554,6 +555,10 @@ int sr_get_module_access(sr_conn_ctx_t *conn, const char *module_name, char **ow
 /**
  * @brief Enable a module feature. Deferred until there are no connections!
  *
+ * Note that no recursive if-feature checks are performed meaning the feature may
+ * still be effectively disabled in case some of its if-features are disabled.
+ * This can be checked using `sysrepoctl -l`.
+ *
  * Required WRITE access.
  *
  * @param[in] conn Connection to use.
@@ -565,6 +570,9 @@ int sr_enable_module_feature(sr_conn_ctx_t *conn, const char *module_name, const
 
 /**
  * @brief Disable a module feature. Deferred until there are no connections!
+ *
+ * Note that this may effectively also disable any dependant features.
+ * This can be checked using `sysrepoctl -l`.
  *
  * Required WRITE access.
  *
@@ -627,7 +635,7 @@ typedef enum sr_type_e {
     SR_UINT32_T,       /**< 32-bit unsigned integer ([RFC 7950 sec 9.2](https://tools.ietf.org/html/rfc7950#section-9.2)) */
     SR_UINT64_T,       /**< 64-bit unsigned integer ([RFC 7950 sec 9.2](https://tools.ietf.org/html/rfc7950#section-9.2)) */
     SR_ANYXML_T,       /**< Unknown chunk of XML ([RFC 7950 sec 7.10](https://tools.ietf.org/html/rfc7950#section-7.10)) */
-    SR_ANYDATA_T,      /**< Unknown set of nodes, encoded in XML ([RFC 7950 sec 7.10](https://tools.ietf.org/html/rfc7950#section-7.10)) */
+    SR_ANYDATA_T       /**< Unknown set of nodes, encoded in XML ([RFC 7950 sec 7.10](https://tools.ietf.org/html/rfc7950#section-7.10)) */
 } sr_type_t;
 
 /**
@@ -693,7 +701,7 @@ typedef enum sr_get_oper_flag_e {
                                           parents, these are also returned (with keys if lists). */
     SR_OPER_NO_SUBS = 4,             /**< Return only stored operational data (push), do not call subscriber callbacks (pull). */
     SR_OPER_NO_STORED = 8,           /**< Do not merge with stored operational data (push). */
-    SR_OPER_WITH_ORIGIN = 16,        /**< Return data with their [origin attributes](@ref datastores). Nodes without
+    SR_OPER_WITH_ORIGIN = 16         /**< Return data with their [origin attributes](@ref datastores). Nodes without
                                           one inherit the origin from parents. */
 } sr_get_oper_flag_t;
 
@@ -739,7 +747,7 @@ int sr_get_item(sr_session_ctx_t *session, const char *path, uint32_t timeout_ms
  * @param[in] xpath [XPath](@ref paths) of the data elements to be retrieved.
  * @param[in] timeout_ms Operational callback timeout in milliseconds. If 0, default is used.
  * @param[in] opts Options overriding default get behaviour.
- * @param[out] values Array of requested nodes, allocated dynamically (free using ::sr_free_values).
+ * @param[out] values Array of requested nodes, if any, allocated dynamically (free using ::sr_free_values).
  * @param[out] value_cnt Number of returned elements in the values array.
  * @return Error code (::SR_ERR_OK on success).
  */
@@ -760,7 +768,7 @@ int sr_get_items(sr_session_ctx_t *session, const char *xpath, uint32_t timeout_
  * @param[in] session Session ([DS](@ref sr_datastore_t)-specific) to use.
  * @param[in] path [Path](@ref paths) selecting the root node of the subtree to be retrieved.
  * @param[in] timeout_ms Operational callback timeout in milliseconds. If 0, default is used.
- * @param[out] subtree Requested subtree, allocated dynamically.
+ * @param[out] subtree Requested subtree, allocated dynamically. NULL if none found.
  * @return Error code (::SR_ERR_OK on success, ::SR_ERR_INVAL_ARG if multiple nodes match the path).
  */
 int sr_get_subtree(sr_session_ctx_t *session, const char *path, uint32_t timeout_ms, struct lyd_node **subtree);
@@ -786,7 +794,7 @@ int sr_get_subtree(sr_session_ctx_t *session, const char *path, uint32_t timeout
  * descendant nodes. If a list should be returned, its keys are always returned as well.
  * @param[in] timeout_ms Operational callback timeout in milliseconds. If 0, default is used.
  * @param[in] opts Options overriding default get behaviour.
- * @param[out] data Connected top-level trees with all the requested data, allocated dynamically.
+ * @param[out] data Connected top-level trees with all the requested data, allocated dynamically. NULL if none found.
  * @return Error code (::SR_ERR_OK on success).
  */
 int sr_get_data(sr_session_ctx_t *session, const char *xpath, uint32_t max_depth, uint32_t timeout_ms,
@@ -829,10 +837,10 @@ typedef enum sr_edit_flag_e {
     SR_EDIT_STRICT = 2,         /**< Strict behavior:
                                      by ::sr_set_item the identified element must not exist (similar to NETCONF create operation),
                                      by ::sr_delete_item the identified element must exist (similar to NETCONF delete operation). */
-    SR_EDIT_ISOLATE = 4,        /**< Create new operation separately, independent of all the previous operations. Since all the
+    SR_EDIT_ISOLATE = 4         /**< Create new operation separately, independent of all the previous operations. Since all the
                                      operations are concatenated into one edit tree, it may happen that 2 incompatible operations
-                                     are set and an error is observed. This flag can in those cases be used. However, note that
-                                     it can adversely affect edit performance. */
+                                     are set and an error is observed. This flag can in those cases be used. Also, if an error
+                                     is returned the previous edit is always left untouched. */
 } sr_edit_flag_t;
 
 /**
@@ -848,7 +856,7 @@ typedef enum sr_move_position_e {
     SR_MOVE_BEFORE = 0,    /**< Move the specified item before the selected sibling. */
     SR_MOVE_AFTER = 1,     /**< Move the specified item after the selected. */
     SR_MOVE_FIRST = 2,     /**< Move the specified item to the position of the first child. */
-    SR_MOVE_LAST = 3,      /**< Move the specified item to the position of the last child. */
+    SR_MOVE_LAST = 3       /**< Move the specified item to the position of the last child. */
 } sr_move_position_t;
 
 /**
@@ -871,7 +879,7 @@ typedef enum sr_move_position_e {
  * @param[in] path [Path](@ref paths) identifier of the data element to be set.
  * @param[in] value Value to be set. `xpath` member of the ::sr_val_t structure can be NULL.
  * @param[in] opts Options overriding default behavior of this call.
- * @return Error code (::SR_ERR_OK on success).
+ * @return Error code (::SR_ERR_OK on success, ::SR_ERR_OPERATION_FAILED if the whole edit was discarded).
  */
 int sr_set_item(sr_session_ctx_t *session, const char *path, const sr_val_t *value, const sr_edit_options_t opts);
 
@@ -887,7 +895,7 @@ int sr_set_item(sr_session_ctx_t *session, const char *path, const sr_val_t *val
  * @param[in] value String representation of the value to be set.
  * @param[in] origin Origin of the value, used only for ::SR_DS_OPERATIONAL edits.
  * @param[in] opts Options overriding default behavior of this call.
- * @return Error code (::SR_ERR_OK on success).
+ * @return Error code (::SR_ERR_OK on success, ::SR_ERR_OPERATION_FAILED if the whole edit was discarded).
  */
 int sr_set_item_str(sr_session_ctx_t *session, const char *path, const char *value, const char *origin,
         const sr_edit_options_t opts);
@@ -903,7 +911,7 @@ int sr_set_item_str(sr_session_ctx_t *session, const char *path, const char *val
  * @param[in] session Session ([DS](@ref sr_datastore_t)-specific) to use.
  * @param[in] path [Path](@ref paths) identifier of the data element to be deleted.
  * @param[in] opts Options overriding default behavior of this call.
- * @return Error code (::SR_ERR_OK on success).
+ * @return Error code (::SR_ERR_OK on success, ::SR_ERR_OPERATION_FAILED if the whole edit was discarded).
  */
 int sr_delete_item(sr_session_ctx_t *session, const char *path, const sr_edit_options_t opts);
 
@@ -929,7 +937,7 @@ int sr_delete_item(sr_session_ctx_t *session, const char *path, const sr_edit_op
  * to determine relative position, needed only if position argument is ::SR_MOVE_BEFORE or ::SR_MOVE_AFTER.
  * @param[in] origin Origin of the value, used only for ::SR_DS_OPERATIONAL edits.
  * @param[in] opts Options overriding default behavior of this call.
- * @return Error code (::SR_ERR_OK on success).
+ * @return Error code (::SR_ERR_OK on success, ::SR_ERR_OPERATION_FAILED if the whole edit was discarded).
  */
 int sr_move_item(sr_session_ctx_t *session, const char *path, const sr_move_position_t position, const char *list_keys,
         const char *leaflist_value, const char *origin, const sr_edit_options_t opts);
@@ -974,9 +982,7 @@ int sr_validate(sr_session_ctx_t *session, const char *module_name, uint32_t tim
  * @param[in] timeout_ms Configuration callback timeout in milliseconds. If 0, default is used. Note that this timeout
  * is measured separately for each callback meaning this whole function call can easily __take more time__ than this
  * timeout if there are changes applied for several subscribers.
- * @param[in] wait Whether to wait until all callbacks on all events are finished (even ::SR_EV_DONE or ::SR_EV_ABORT).
- * If not set, these events may not yet be processed after the function returns. Note that all ::SR_EV_CHANGE events
- * are always waited for.
+ * @param[in] wait Deprecated and ignored, the function always waits until all the events are processed.
  * @return Error code (::SR_ERR_OK on success).
  */
 int sr_apply_changes(sr_session_ctx_t *session, uint32_t timeout_ms, int wait);
@@ -1007,9 +1013,7 @@ int sr_discard_changes(sr_session_ctx_t *session);
  * @param[in] module_name If specified, limits the replace operation only to this module.
  * @param[in] src_config Source data to replace the datastore. Is ALWAYS spent and cannot be further used by the application!
  * @param[in] timeout_ms Configuration callback timeout in milliseconds. If 0, default is used.
- * @param[in] wait Whether to wait until all callbacks on all events are finished (even ::SR_EV_DONE or ::SR_EV_ABORT).
- * If not set, these events may not yet be processed after the function returns. Note that all ::SR_EV_CHANGE events
- * are always waited for.
+ * @param[in] wait Deprecated and ignored, the function always waits until all the events are processed.
  * @return Error code (::SR_ERR_OK on success).
  */
 int sr_replace_config(sr_session_ctx_t *session, const char *module_name, struct lyd_node *src_config,
@@ -1030,9 +1034,7 @@ int sr_replace_config(sr_session_ctx_t *session, const char *module_name, struct
  * @param[in] module_name Optional module name that limits the copy operation only to this module.
  * @param[in] src_datastore Source datastore.
  * @param[in] timeout_ms Configuration callback timeout in milliseconds. If 0, default is used.
- * @param[in] wait Whether to wait until all callbacks on all events are finished (even ::SR_EV_DONE or ::SR_EV_ABORT).
- * If not set, these events may not yet be processed after the function returns. Note that all ::SR_EV_CHANGE events
- * are always waited for.
+ * @param[in] wait Deprecated and ignored, the function always waits until all the events are processed.
  * @return Error code (::SR_ERR_OK on success).
  */
 int sr_copy_config(sr_session_ctx_t *session, const char *module_name, sr_datastore_t src_datastore, uint32_t timeout_ms,
@@ -1080,9 +1082,9 @@ int sr_unlock(sr_session_ctx_t *session, const char *module_name);
 /**
  * @brief Check whether the data of the specified module or the whole datastore are locked.
  *
- * Note that if whole datastore is checked, \p is_locked will be set only if all
+ * Note that if whole datastore is checked, @p is_locked will be set only if all
  * the modules are locked by the same Sysrepo session. If a module is not locked
- * or locked by another Sysrepo session, \p is_locked will be false.
+ * or locked by another Sysrepo session, @p is_locked will be false.
  *
  * @param[in] conn Connection to use.
  * @param[in] datastore Datastore of the lock.
@@ -1163,17 +1165,13 @@ typedef enum sr_subscr_flag_e {
      * @brief The subscriber will be called before any other subscribers for the particular module
      * with an additional ::SR_EV_UPDATE event and is then allowed to modify the new module data. It can add new changes
      * by calling standard set functions (such as ::sr_set_item_str) on the implicit callback session and returning.
-     * Note that you cannot subscribe more callbacks with this flags on one module with the same priority.
+     * Note that you cannot subscribe more callbacks with this flag on one module with the same priority.
      */
     SR_SUBSCR_UPDATE = 32,
 
     /**
-     * @brief The subscriber wants to modify other subscriptions in its callback. Normally, this would
-     * cause deadlock but with this flag it is possible. But, there are some **limitations**. The callback
-     * MUST not subscribe to the same RPC/module DS changes it is processing (would change subscription count
-     * and cause invalid memory access) and MUST not subscribe on the same ::sr_subscription_ctx_t
-     * `subscription` (would cause a deadlock). Accepted **only** for RPC/action and change subscriptions,
-     * it makes no sense for others.
+     * @brief The options should not be used as it is deprecated and ignored. Callbacks can always modify other
+     * subscriptions except for those that are relevant for the particular subscription and callback.
      */
     SR_SUBSCR_UNLOCKED = 64,
 
@@ -1182,7 +1180,7 @@ typedef enum sr_subscr_flag_e {
      * subscription callback, keep them. Then the returned data are merged into the existing data. Accepted
      * only for operational subscriptions.
      */
-    SR_SUBSCR_OPER_MERGE = 128,
+    SR_SUBSCR_OPER_MERGE = 128
 
 } sr_subscr_flag_t;
 
@@ -1277,7 +1275,7 @@ typedef enum sr_event_e {
                         ::SR_EV_DONE. It can fail and will also be triggered even when there is no startup configuration
                         (which is different from the ::SR_EV_CHANGE event). Also note that the callback on this event
                         __cannot__ return ::SR_ERR_CALLBACK_SHELVE. */
-    SR_EV_RPC,     /**< Occurs for a standard RPC execution. If a later callback fails, ::SR_EV_ABORT is generated. */
+    SR_EV_RPC      /**< Occurs for a standard RPC execution. If a later callback fails, ::SR_EV_ABORT is generated. */
 } sr_event_t;
 
 /**
@@ -1287,7 +1285,7 @@ typedef enum sr_change_oper_e {
     SR_OP_CREATED,   /**< The item has been created by the change. */
     SR_OP_MODIFIED,  /**< The value of the item has been modified by the change. */
     SR_OP_DELETED,   /**< The item has been deleted by the change. */
-    SR_OP_MOVED,     /**< The item has been moved in the subtree by the change (applicable for leaf-lists and user-ordered lists). */
+    SR_OP_MOVED      /**< The item has been moved in the subtree by the change (applicable for leaf-lists and user-ordered lists). */
 } sr_change_oper_t;
 
 /**
@@ -1298,15 +1296,14 @@ typedef struct sr_change_iter_s sr_change_iter_t;
 /**
  * @brief Callback to be called on the event of changing datastore content of the specified module.
  *
- * @note Callback is allowed to modify installed YANG modules but MUST not modify subscriptions on ::SR_EV_CHANGE event.
- * It would result in a deadlock and this callback timeout (unless ::SR_SUBSCR_UNLOCKED is used when subscribing).
+ * @note Callback must not modify the same module and datastore change subscriptions, it would result in a deadlock.
  *
  * @param[in] session Implicit session (do not stop) with information about the changed data (retrieved by
  * ::sr_get_changes_iter) the event originator session IDs.
  * @param[in] module_name Name of the module where the change has occurred.
  * @param[in] xpath [XPath](@ref paths) used when subscribing, NULL if the whole module was subscribed to.
  * @param[in] event Type of the callback event that has occurred.
- * @param[in] request_id Request ID unique for the specific \p module_name. Connected events
+ * @param[in] request_id Request ID unique for the specific @p module_name. Connected events
  * for one request (::SR_EV_CHANGE and ::SR_EV_DONE, for example) have the same request ID.
  * @param[in] private_data Private context opaque to sysrepo, as passed to ::sr_module_change_subscribe call.
  * @return User error code (::SR_ERR_OK on success).
@@ -1396,13 +1393,13 @@ int sr_get_change_next(sr_session_ctx_t *session, sr_change_iter_t *iter, sr_cha
  * by ::sr_get_changes_iter call. Data are represented as _libyang_ subtrees.
  *
  * @note Meaning of output parameters varies based on the operation:
- * ::SR_OP_CREATED - \p node is the created node, for user-ordered lists either \p prev_value or \p prev_list is
+ * ::SR_OP_CREATED - @p node is the created node, for user-ordered lists either @p prev_value or @p prev_list is
  * always set with meaning similar to ::SR_OP_MOVED.
- * ::SR_OP_MODIFIED - \p node is the modified node, \p prev_value is set to the previous value of the leaf,
- * \p prev_dflt is set if the previous leaf value was the default.
- * ::SR_OP_DELETED - \p node is the deleted node.
- * ::SR_OP_MOVED - \p node is the moved (leaf-)list instance, for user-ordered lists either \p prev_value (leaf-list) or
- * \p prev_list (list) is set to the preceding instance unless the node is the first, when they are set to "" (empty string).
+ * ::SR_OP_MODIFIED - @p node is the modified node, @p prev_value is set to the previous value of the leaf,
+ * @p prev_dflt is set if the previous leaf value was the default.
+ * ::SR_OP_DELETED - @p node is the deleted node.
+ * ::SR_OP_MOVED - @p node is the moved (leaf-)list instance, for user-ordered lists either @p prev_value (leaf-list) or
+ * @p prev_list (list) is set to the preceding instance unless the node is the first, when they are set to "" (empty string).
  *
  * @param[in] session Implicit session provided in the callbacks (::sr_module_change_cb). Will not work with other sessions.
  * @param[in,out] iter Iterator acquired with ::sr_get_changes_iter call.
@@ -1437,37 +1434,34 @@ void sr_free_change_iter(sr_change_iter_t *iter);
 /**
  * @brief Callback to be called for the delivery of an RPC/action. Data are represented as ::sr_val_t structures.
  *
- * @note Callback is allowed to modify installed YANG modules but MUST not modify subscriptions. It would result in
- * a deadlock and this callback timeout (unless ::SR_SUBSCR_UNLOCKED is used when subscribing).
+ * @note Callback must not modify any RPC/action subscriptions, it would result in a deadlock.
  *
  * @param[in] session Implicit session (do not stop) with information about event originator session IDs.
- * @param[in] op_path Simple operation [path](@ref paths) identifying the RPC/action.
+ * @param[in] xpath Full operation [xpath](@ref paths) identifying the exact RPC/action executed.
  * @param[in] input Array of input parameters.
  * @param[in] input_cnt Number of input parameters.
  * @param[in] event Type of the callback event that has occurred.
- * @param[in] request_id Request ID unique for the specific \p op_path.
+ * @param[in] request_id Request ID unique for the specific @p op_path.
  * @param[out] output Array of output parameters. Should be allocated on heap,
  * will be freed by sysrepo after sending of the RPC response.
  * @param[out] output_cnt Number of output parameters.
  * @param[in] private_data Private context opaque to sysrepo, as passed to ::sr_rpc_subscribe call.
  * @return User error code (::SR_ERR_OK on success).
  */
-typedef int (*sr_rpc_cb)(sr_session_ctx_t *session, const char *op_path, const sr_val_t *input, const size_t input_cnt,
+typedef int (*sr_rpc_cb)(sr_session_ctx_t *session, const char *xpath, const sr_val_t *input, const size_t input_cnt,
         sr_event_t event, uint32_t request_id, sr_val_t **output, size_t *output_cnt, void *private_data);
 
 /**
  * @brief Callback to be called for the delivery of an RPC/action. Data are represented as _libyang_ subtrees.
  *
- * @note Callback is allowed to modify installed YANG modules but MUST not modify subscriptions. It would result in
- * a deadlock and this callback timeout (unless ::SR_SUBSCR_UNLOCKED is used when subscribing).
+ * @note Callback must not modify any RPC/action subscriptions, it would result in a deadlock.
  *
  * @param[in] session Implicit session (do not stop) with information about the event originator session IDs.
  * @param[in] op_path Simple operation [path](@ref paths) identifying the RPC/action.
  * @param[in] input Data tree of input parameters. Always points to the __RPC/action__ itself, even for nested operations.
  * @param[in] event Type of the callback event that has occurred.
- * @param[in] request_id Request ID unique for the specific \p op_path.
- * @param[out] output Data tree of output parameters. Should be allocated on heap,
- * will be freed by sysrepo after sending of the RPC response.
+ * @param[in] request_id Request ID unique for the specific @p op_path.
+ * @param[out] output Data tree for appending any output parameters, the operation root node is provided..
  * @param[in] private_data Private context opaque to sysrepo, as passed to ::sr_rpc_subscribe_tree call.
  * @return User error code (::SR_ERR_OK on success).
  */
@@ -1570,29 +1564,32 @@ typedef enum sr_ev_notif_type_e {
                                        (all the stored notifications from the given time interval have been delivered). */
     SR_EV_NOTIF_STOP,             /**< Not a real notification, just a signal that replay stop time has been reached
                                        (delivered only if stop_time was specified when subscribing). */
+    SR_EV_NOTIF_SUSPENDED,        /**< Not a real notification, just a signal that the notification was suspended. */
+    SR_EV_NOTIF_RESUMED           /**< Not a real notification, just a signal that the notification was resumed after
+                                       previously suspended. */
 } sr_ev_notif_type_t;
 
 /**
  * @brief Callback to be called for the delivery of a notification. Data are represented as ::sr_val_t structures.
  *
- * @note Callback is allowed to modify installed YANG modules and subscriptions.
+ * @note Callback must not modify the same module notification subscriptions, it would result in a deadlock.
  *
  * @param[in] session Implicit session (do not stop) with information about the event originator session IDs.
  * @param[in] notif_type Type of the notification.
- * @param[in] path [Path](@ref paths) identifying the event notification.
+ * @param[in] xpath Full operation [xpath](@ref paths) identifying the exact notification executed.
  * @param[in] values Array of all nodes that hold some data in event notification subtree.
  * @param[in] values_cnt Number of items inside the values array.
  * @param[in] timestamp Time when the notification was generated
  * @param[in] private_data Private context opaque to sysrepo,
  * as passed to ::sr_event_notif_subscribe call.
  */
-typedef void (*sr_event_notif_cb)(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const char *path,
+typedef void (*sr_event_notif_cb)(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const char *xpath,
         const sr_val_t *values, const size_t values_cnt, time_t timestamp, void *private_data);
 
 /**
  * @brief Callback to be called for the delivery of a notification. Data are represented as _libyang_ subtrees.
  *
- * @note Callback is allowed to modify installed YANG modules and subscriptions.
+ * @note Callback must not modify the same module notification subscriptions, it would result in a deadlock.
  *
  * @param[in] session Implicit session (do not stop) with information about the event originator session IDs.
  * @param[in] notif_type Type of the notification.
@@ -1680,6 +1677,33 @@ int sr_event_notif_send(sr_session_ctx_t *session, const char *path, const sr_va
  */
 int sr_event_notif_send_tree(sr_session_ctx_t *session, struct lyd_node *notif);
 
+/**
+ * @brief Get the subscription ID of the last notification subscription.
+ *
+ * @param[in] subscription Subscription context to read from.
+ * @return Unique notification subscription ID.
+ */
+uint32_t sr_event_notif_sub_id_get_last(const sr_subscription_ctx_t *subscription);
+
+/**
+ * @brief Suspend a notification subscription, special ::SR_EV_NOTIF_SUSPENDED notification is delivered.
+ *
+ * @param[in] subscription Subscription context to use.
+ * @param[in] sub_id Subscription ID of the specific subscription to suspend.
+ * @return Error code (::SR_ERR_OK on success).
+ */
+int sr_event_notif_sub_suspend(sr_subscription_ctx_t *subscription, uint32_t sub_id);
+
+/**
+ * @brief Resume a previously suspended notification subscription, special ::SR_EV_NOTIF_RESUMED notification is
+ * delivered.
+ *
+ * @param[in] subscription Subscription context to use.
+ * @param[in] sub_id Subscription ID of the specific subscription to resume.
+ * @return Error code (::SR_ERR_OK on success).
+ */
+int sr_event_notif_sub_resume(sr_subscription_ctx_t *subscription, uint32_t sub_id);
+
 /** @} notifsubs */
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1701,15 +1725,14 @@ int sr_event_notif_send_tree(sr_session_ctx_t *session, struct lyd_node *notif);
  * they will be called after this one (and when they are called, their parent children will again be removed
  * which can result in nodes provided by the original callback being lost).
  *
- * @note Callback is allowed to modify installed YANG modules but MUST not modify subscriptions. It would result in
- * a deadlock and this callback timeout.
+ * @note Callback must not modify the same module operational subscriptions, it would result in a deadlock.
  *
  * @param[in] session Implicit session (do not stop) with information about the event originator session IDs.
  * @param[in] module_name Name of the affected module.
  * @param[in] path [Path](@ref paths) identifying the subtree that is supposed to be provided, same as the one used
  * for the subscription.
  * @param[in] request_xpath [XPath](@ref paths) as requested by a client. Can be NULL.
- * @param[in] request_id Request ID unique for the specific \p module_name.
+ * @param[in] request_id Request ID unique for the specific @p module_name.
  * @param[in,out] parent Pointer to an existing parent of the requested nodes. Is NULL for top-level nodes.
  * Caller is supposed to append the requested nodes to this data subtree and return either the original parent
  * or a top-level node.
@@ -1724,11 +1747,14 @@ typedef int (*sr_oper_get_items_cb)(sr_session_ctx_t *session, const char *modul
  *
  * Required WRITE access.
  *
+ * @note Be aware of some specific [threading limitations](@ref oper_subs).
+ *
  * @param[in] session Session (not [DS](@ref sr_datastore_t)-specific) to use.
  * @param[in] module_name Name of the affected module.
- * @param[in] path [Path](@ref paths) identifying the subtree which the provider is able to provide. Predicates can be
- * used to provide only specific instances of nodes. Before calling this callback, any existing data matching this
- * path __are deleted__.
+ * @param[in] path [Path](@ref paths) identifying the subtree (not strictly required, all list/leaf-list instances
+ * are also valid, for example) which the provider is able to provide. Predicates can be used to provide only
+ * specific instances of nodes. Before calling this callback, any existing data matching this path __are deleted__
+ * (unless modified by @p opts).
  * @param[in] callback Callback to be called when the operational data for the given xpath are requested.
  * @param[in] private_data Private context passed to the callback function, opaque to sysrepo.
  * @param[in] opts Options overriding default behavior of the subscription, it is supposed to be
@@ -1786,34 +1812,30 @@ typedef void (*srp_cleanup_cb_t)(sr_session_ctx_t *session, void *private_data);
 /**
  * @brief Log a plugin error message with format arguments.
  *
- * @param[in] format Message format.
- * @param[in] ... Format arguments.
+ * @param[in] ... Format string and arguments.
  */
-#define SRP_LOG_ERR(format, ...) srp_log(SR_LL_ERR, format, __VA_ARGS__)
+#define SRP_LOG_ERR(...) srp_log(SR_LL_ERR, __VA_ARGS__)
 
 /**
  * @brief Log a plugin warning message with format arguments.
  *
- * @param[in] format Message format.
- * @param[in] ... Format arguments.
+ * @param[in] ... Format string and arguments.
  */
-#define SRP_LOG_WRN(format, ...) srp_log(SR_LL_WRN, format, __VA_ARGS__)
+#define SRP_LOG_WRN(...) srp_log(SR_LL_WRN, __VA_ARGS__)
 
 /**
  * @brief Log a plugin info message with format arguments.
  *
- * @param[in] format Message format.
- * @param[in] ... Format arguments.
+ * @param[in] ... Format string and arguments.
  */
-#define SRP_LOG_INF(format, ...) srp_log(SR_LL_INF, format, __VA_ARGS__)
+#define SRP_LOG_INF(...) srp_log(SR_LL_INF, __VA_ARGS__)
 
 /**
  * @brief Log a plugin debug message with format arguments.
  *
- * @param[in] format Message format.
- * @param[in] ... Format arguments.
+ * @param[in] ... Format string and arguments.
  */
-#define SRP_LOG_DBG(format, ...) srp_log(SR_LL_DBG, format, __VA_ARGS__)
+#define SRP_LOG_DBG(...) srp_log(SR_LL_DBG, __VA_ARGS__)
 
 /**
  * @brief Log a simple plugin error message.

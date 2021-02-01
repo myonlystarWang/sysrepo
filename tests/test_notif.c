@@ -139,7 +139,7 @@ clear_ops(void **state)
     sr_delete_item(st->sess, "/ops-ref:l1", 0);
     sr_delete_item(st->sess, "/ops-ref:l2", 0);
     sr_delete_item(st->sess, "/ops:cont", 0);
-    sr_apply_changes(st->sess, 0, 0);
+    sr_apply_changes(st->sess, 0, 1);
 
     return 0;
 }
@@ -272,7 +272,73 @@ create_ops_notif(void **state)
     return 0;
 }
 
-/* TEST 1 */
+/* TEST */
+static void
+notif_dummy_cb(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const char *xpath, const sr_val_t *values,
+        const size_t values_cnt, time_t timestamp, void *private_data)
+{
+    (void)session;
+    (void)notif_type;
+    (void)xpath;
+    (void)values;
+    (void)values_cnt;
+    (void)timestamp;
+    (void)private_data;
+}
+
+static void
+test_input_parameters(void **state)
+{
+    struct state *st = (struct state *)*state;
+    sr_subscription_ctx_t *subscr;
+    struct lyd_node *input;
+    int ret;
+
+    /* invalid xpath */
+    ret = sr_event_notif_subscribe(st->sess, "ops", "\\ops:notif3", 0, 0, notif_dummy_cb, NULL, 0, &subscr);
+    assert_int_equal(ret, SR_ERR_LY);
+
+    /* non-existing module in xpath */
+    ret = sr_event_notif_subscribe(st->sess, "no-mod", NULL, 0, 0, notif_dummy_cb, NULL, 0,  &subscr);
+    assert_int_equal(ret, SR_ERR_NOT_FOUND);
+
+    /* invalid option(SR_SUBSCR_CTX_REUSE) when subscription NULL */
+    subscr = NULL;
+    ret = sr_event_notif_subscribe(st->sess, "ops", NULL, 0, 0, notif_dummy_cb, NULL, SR_SUBSCR_CTX_REUSE, &subscr);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* non-existing notification in module */
+    ret = sr_event_notif_subscribe(st->sess, "test", NULL, 0, 0, notif_dummy_cb, NULL, 0, &subscr);
+    assert_int_equal(ret, SR_ERR_NOT_FOUND);
+
+    /* non-existing notification node in xpath */
+    ret = sr_event_notif_subscribe(st->sess, "ops", "/ops:rpc1", 0, 0, notif_dummy_cb, NULL, 0, &subscr);
+    assert_int_equal(ret, SR_ERR_INVAL_ARG);
+
+    /* data tree must be created with the session connection libyang context */
+    struct ly_ctx *ctx = ly_ctx_new(TESTS_DIR"/files/", 0);
+    assert_non_null(ctx);
+    const struct lys_module *mod = lys_parse_path(ctx, TESTS_DIR"/files/simple.yang", LYS_IN_YANG);
+    assert_non_null(mod);
+    input = lyd_new_path(NULL, ctx, "/simple:ac1", NULL, 0, LYD_PATH_OPT_NOPARENTRET);
+    assert_non_null(input);
+    ret = sr_event_notif_send_tree(st->sess, input);
+    assert_int_equal(ret, SR_ERR_INVAL_ARG);
+    lyd_free_withsiblings(input);
+    ly_ctx_destroy(ctx, NULL);
+
+    /* data tree not a valid notification invovation */
+    input = lyd_new_path(NULL, sr_get_context(st->conn), "/ops:cont/list1[k='key']/cont2", NULL, 0, LYD_PATH_OPT_NOPARENTRET);
+    assert_non_null(input);
+    ret = sr_event_notif_send_tree(st->sess, input);
+    assert_int_equal(ret, SR_ERR_INVAL_ARG);
+    for ( ; input->parent; input = input->parent);
+    lyd_free_withsiblings(input);
+
+    sr_unsubscribe(subscr);
+}
+
+/* TEST */
 static void
 notif_simple_cb(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const char *xpath, const sr_val_t *values,
         const size_t values_cnt, time_t timestamp, void *private_data)
@@ -339,7 +405,7 @@ test_simple(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_set_item_str(st->sess, "/ops:cont/list1[k='key']", NULL, NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /*
@@ -427,7 +493,7 @@ test_simple(void **state)
     sr_unsubscribe(subscr3);
 }
 
-/* TEST 2 */
+/* TEST */
 static void
 notif_stop_cb(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const struct lyd_node *notif,
         time_t timestamp, void *private_data)
@@ -471,7 +537,7 @@ test_stop(void **state)
     sr_unsubscribe(subscr);
 }
 
-/* TEST 3 */
+/* TEST */
 static void
 notif_replay_simple_cb(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const struct lyd_node *notif,
         time_t timestamp, void *private_data)
@@ -518,7 +584,7 @@ test_replay_simple(void **state)
     /* set some data needed for validation */
     ret = sr_set_item_str(st->sess, "/ops:cont/list1[k='key']", NULL, NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* subscribe to the data so they are actually present in operational */
@@ -553,7 +619,7 @@ test_replay_simple(void **state)
     sr_unsubscribe(subscr);
 }
 
-/* TEST 4 */
+/* TEST */
 static void
 notif_replay_interval_cb(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const struct lyd_node *notif,
         time_t timestamp, void *private_data)
@@ -715,7 +781,7 @@ test_replay_interval(void **state)
     sr_unsubscribe(subscr);
 }
 
-/* TEST 5 */
+/* TEST */
 static void
 notif_no_replay_cb(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const struct lyd_node *notif,
         time_t timestamp, void *private_data)
@@ -757,7 +823,7 @@ test_no_replay(void **state)
     /* set some data needed for validation */
     ret = sr_set_item_str(st->sess, "/ops:cont/list1[k='key']", NULL, NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* subscribe to the data so they are actually present in operational */
@@ -791,7 +857,7 @@ test_no_replay(void **state)
     sr_unsubscribe(subscr);
 }
 
-/* TEST 6 */
+/* TEST */
 static void
 notif_config_change_cb(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const struct lyd_node *notif,
         time_t timestamp, void *private_data)
@@ -934,7 +1000,7 @@ test_notif_config_change(void **state)
     /* repeatedly set some data and check the notification */
     ret = sr_set_item_str(st->sess, "/ops:cont/list1[k='key']", NULL, NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* wait for the notification */
@@ -951,7 +1017,7 @@ test_notif_config_change(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_set_item_str(st->sess, "/ops-ref:l2", "other-val", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* wait for the notification */
@@ -962,7 +1028,7 @@ test_notif_config_change(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_set_item_str(st->sess, "/ops-ref:l1", "val2", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* wait for the notification */
@@ -975,7 +1041,7 @@ test_notif_config_change(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_delete_item(st->sess, "/test:cont/l2[k='two:three']", 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(st->sess, 0, 0);
+    ret = sr_apply_changes(st->sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
 
     /* wait for the notification */
@@ -985,7 +1051,7 @@ test_notif_config_change(void **state)
     sr_unsubscribe(subscr);
 }
 
-/* TEST 7 */
+/* TEST */
 static void
 test_notif_buffer(void **state)
 {
@@ -1021,11 +1087,105 @@ test_notif_buffer(void **state)
     lyd_free_withsiblings(notif);
 }
 
+/* TEST */
+static void
+notif_suspend_cb(sr_session_ctx_t *session, const sr_ev_notif_type_t notif_type, const char *xpath, const sr_val_t *values,
+        const size_t values_cnt, time_t timestamp, void *private_data)
+{
+    struct state *st = (struct state *)private_data;
+
+    (void)values;
+    (void)values_cnt;
+    (void)timestamp;
+
+    switch (st->cb_called) {
+    case 0:
+        assert_int_equal(sr_session_get_nc_id(session), 1000);
+        assert_int_equal(notif_type, SR_EV_NOTIF_REALTIME);
+        assert_string_equal(xpath, "/ops:notif4");
+        break;
+    case 1:
+        assert_int_equal(sr_session_get_nc_id(session), 0);
+        assert_int_equal(notif_type, SR_EV_NOTIF_SUSPENDED);
+        assert_null(xpath);
+        break;
+    case 2:
+        assert_int_equal(sr_session_get_nc_id(session), 0);
+        assert_int_equal(notif_type, SR_EV_NOTIF_RESUMED);
+        assert_null(xpath);
+        break;
+    case 3:
+        assert_int_equal(sr_session_get_nc_id(session), 1000);
+        assert_int_equal(notif_type, SR_EV_NOTIF_REALTIME);
+        assert_string_equal(xpath, "/ops:notif4");
+        break;
+    default:
+        fail();
+    }
+
+    /* signal that we were called */
+    ++st->cb_called;
+    if (notif_type == SR_EV_NOTIF_REALTIME) {
+        pthread_barrier_wait(&st->barrier);
+    }
+}
+
+static void
+test_suspend(void **state)
+{
+    struct state *st = (struct state *)*state;
+    sr_subscription_ctx_t *subscr;
+    int ret;
+    uint32_t sub_id;
+
+    st->cb_called = 0;
+
+    /* subscribe */
+    ret = sr_event_notif_subscribe(st->sess, "ops", NULL, 0, 0, notif_suspend_cb, st, 0, &subscr);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* send a notif */
+    ret = sr_event_notif_send(st->sess, "/ops:notif4", NULL, 0);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* wait for the callback */
+    pthread_barrier_wait(&st->barrier);
+    assert_int_equal(st->cb_called, 1);
+
+    /* suspend */
+    sub_id = sr_event_notif_sub_id_get_last(subscr);
+    ret = sr_event_notif_sub_suspend(subscr, sub_id);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    assert_int_equal(st->cb_called, 2);
+
+    /* send a notif, it is not delivered */
+    ret = sr_event_notif_send(st->sess, "/ops:notif4", NULL, 0);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* resume */
+    ret = sr_event_notif_sub_resume(subscr, sub_id);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    assert_int_equal(st->cb_called, 3);
+
+    /* send a notif */
+    ret = sr_event_notif_send(st->sess, "/ops:notif4", NULL, 0);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* wait for the callback */
+    pthread_barrier_wait(&st->barrier);
+    assert_int_equal(st->cb_called, 4);
+
+    sr_unsubscribe(subscr);
+}
+
 /* MAIN */
 int
 main(void)
 {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_input_parameters),
         cmocka_unit_test_teardown(test_simple, clear_ops),
         cmocka_unit_test_setup(test_stop, clear_ops_notif),
         cmocka_unit_test_setup_teardown(test_replay_simple, clear_ops_notif, clear_ops),
@@ -1033,6 +1193,7 @@ main(void)
         cmocka_unit_test_setup_teardown(test_no_replay, clear_ops_notif, clear_ops),
         cmocka_unit_test_teardown(test_notif_config_change, clear_ops),
         cmocka_unit_test(test_notif_buffer),
+        cmocka_unit_test(test_suspend),
     };
 
     setenv("CMOCKA_TEST_ABORT", "1", 1);

@@ -19,6 +19,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #ifndef _EDIT_DIFF_H
 #define _EDIT_DIFF_H
 
@@ -128,7 +129,7 @@ sr_error_info_t *sr_edit_mod_apply(const struct lyd_node *edit, const struct lys
  * @param[out] change Optional, set if there were some diff changes.
  * @return err_info, NULL on success.
  */
-sr_error_info_t *sr_diff_mod_merge(const struct lyd_node *src_diff, void *oper_conn, const struct lys_module *ly_mod,
+sr_error_info_t *sr_diff_mod_merge(const struct lyd_node *src_diff, sr_conn_ctx_t *oper_conn, const struct lys_module *ly_mod,
         struct lyd_node **diff, int *change);
 
 /**
@@ -220,10 +221,9 @@ sr_error_info_t *sr_diff_reverse(const struct lyd_node *diff, struct lyd_node **
  * @brief Remove all stored diff nodes that belong to a connection that is being deleted.
  *
  * @param[in,out] diff Diff to remove from.
- * @param[in] conn Deleted connection.
- * @param[in] pid PID of the process of the deleted connection.
+ * @param[in] cid Connection ID of the deleted connection.
  * @return err_info, NULL on success.
  */
-sr_error_info_t *sr_diff_del_conn(struct lyd_node **diff, sr_conn_ctx_t *conn, pid_t pid);
+sr_error_info_t *sr_diff_del_conn(struct lyd_node **diff, sr_cid_t cid);
 
 #endif

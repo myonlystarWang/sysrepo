@@ -208,7 +208,7 @@ test_data_deps(void **state)
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>test</name>"
         "<removed/>"
-        "<inverse-data-deps>refs</inverse-data-deps>"
+        "<inverse-deps>refs</inverse-deps>"
     "</module>"
     );
     cmp_int_data(st->conn, "ietf-interfaces",
@@ -231,16 +231,16 @@ test_data_deps(void **state)
         "<name>refs</name>"
         "<replay-support>0000000000</replay-support>"
         "<removed/>"
-        "<data-deps>"
+        "<deps>"
             "<module>test</module>"
             "<inst-id>"
-                "<xpath xmlns:r=\"urn:refs\">/r:cont/r:def-inst-id</xpath>"
+                "<path xmlns:r=\"urn:refs\">/r:cont/r:def-inst-id</path>"
                 "<default-module>test</default-module>"
             "</inst-id>"
             "<inst-id>"
-                "<xpath xmlns:r=\"urn:refs\">/r:inst-id</xpath>"
+                "<path xmlns:r=\"urn:refs\">/r:inst-id</path>"
             "</inst-id>"
-        "</data-deps>"
+        "</deps>"
     "</module>"
     );
 }
@@ -282,46 +282,46 @@ test_op_deps(void **state)
     cmp_int_data(st->conn, "ops",
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>ops</name>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:cont/o:list1/o:cont2/o:act1</xpath>"
+        "<rpc>"
+            "<path xmlns:o=\"urn:ops\">/o:cont/o:list1/o:cont2/o:act1</path>"
             "<out>"
                 "<module>ops</module>"
                 "<inst-id>"
-                    "<xpath xmlns:o=\"urn:ops\">/o:cont/o:list1/o:cont2/o:act1/o:l8</xpath>"
+                    "<path xmlns:o=\"urn:ops\">/o:cont/o:list1/o:cont2/o:act1/o:l8</path>"
                     "<default-module>ops</default-module>"
                 "</inst-id>"
             "</out>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:cont/o:cont3/o:notif2</xpath>"
-            "<in>"
-                "<inst-id>"
-                    "<xpath xmlns:o=\"urn:ops\">/o:cont/o:cont3/o:notif2/o:l13</xpath>"
-                "</inst-id>"
-            "</in>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:rpc1</xpath>"
+        "</rpc>"
+        "<rpc>"
+            "<path xmlns:o=\"urn:ops\">/o:rpc1</path>"
             "<in>"
                 "<module>ops-ref</module>"
                 "<inst-id>"
-                    "<xpath xmlns:o=\"urn:ops\">/o:rpc1/o:l2</xpath>"
+                    "<path xmlns:o=\"urn:ops\">/o:rpc1/o:l2</path>"
                     "<default-module>ops-ref</default-module>"
                 "</inst-id>"
             "</in>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:rpc2</xpath>"
+        "</rpc>"
+        "<rpc>"
+            "<path xmlns:o=\"urn:ops\">/o:rpc2</path>"
             "<out>"
                 "<module>ops-ref</module>"
             "</out>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:rpc3</xpath>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:notif4</xpath>"
-        "</op-deps>"
+        "</rpc>"
+        "<rpc>"
+            "<path xmlns:o=\"urn:ops\">/o:rpc3</path>"
+        "</rpc>"
+        "<notification>"
+            "<path xmlns:o=\"urn:ops\">/o:cont/o:cont3/o:notif2</path>"
+            "<deps>"
+                "<inst-id>"
+                    "<path xmlns:o=\"urn:ops\">/o:cont/o:cont3/o:notif2/o:l13</path>"
+                "</inst-id>"
+            "</deps>"
+        "</notification>"
+        "<notification>"
+            "<path xmlns:o=\"urn:ops\">/o:notif4</path>"
+        "</notification>"
     "</module>"
     );
 
@@ -341,59 +341,59 @@ test_op_deps(void **state)
     cmp_int_data(st->conn, "ops",
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>ops</name>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:cont/o:list1/o:cont2/o:act1</xpath>"
+        "<rpc>"
+            "<path xmlns:o=\"urn:ops\">/o:cont/o:list1/o:cont2/o:act1</path>"
             "<out>"
                 "<module>ops</module>"
                 "<inst-id>"
-                    "<xpath xmlns:o=\"urn:ops\">/o:cont/o:list1/o:cont2/o:act1/o:l8</xpath>"
+                    "<path xmlns:o=\"urn:ops\">/o:cont/o:list1/o:cont2/o:act1/o:l8</path>"
                     "<default-module>ops</default-module>"
                 "</inst-id>"
             "</out>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:cont/o:list1/o:act2</xpath>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:cont/o:cont3/o:notif2</xpath>"
-            "<in>"
-                "<inst-id>"
-                    "<xpath xmlns:o=\"urn:ops\">/o:cont/o:cont3/o:notif2/o:l13</xpath>"
-                "</inst-id>"
-            "</in>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:rpc1</xpath>"
+        "</rpc>"
+        "<rpc>"
+            "<path xmlns:o=\"urn:ops\">/o:cont/o:list1/o:act2</path>"
+        "</rpc>"
+        "<rpc>"
+            "<path xmlns:o=\"urn:ops\">/o:rpc1</path>"
             "<in>"
                 "<module>ops-ref</module>"
                 "<inst-id>"
-                    "<xpath xmlns:o=\"urn:ops\">/o:rpc1/o:l2</xpath>"
+                    "<path xmlns:o=\"urn:ops\">/o:rpc1/o:l2</path>"
                     "<default-module>ops-ref</default-module>"
                 "</inst-id>"
             "</in>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:rpc2</xpath>"
+        "</rpc>"
+        "<rpc>"
+            "<path xmlns:o=\"urn:ops\">/o:rpc2</path>"
             "<out>"
                 "<module>ops-ref</module>"
             "</out>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:rpc3</xpath>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:notif3</xpath>"
-            "<in>"
+        "</rpc>"
+        "<rpc>"
+            "<path xmlns:o=\"urn:ops\">/o:rpc3</path>"
+        "</rpc>"
+        "<notification>"
+            "<path xmlns:o=\"urn:ops\">/o:cont/o:cont3/o:notif2</path>"
+            "<deps>"
+                "<inst-id>"
+                    "<path xmlns:o=\"urn:ops\">/o:cont/o:cont3/o:notif2/o:l13</path>"
+                "</inst-id>"
+            "</deps>"
+        "</notification>"
+        "<notification>"
+            "<path xmlns:o=\"urn:ops\">/o:notif3</path>"
+            "<deps>"
                 "<module>ops-ref</module>"
                 "<inst-id>"
-                    "<xpath xmlns:o=\"urn:ops\">/o:notif3/o:list2/o:l15</xpath>"
+                    "<path xmlns:o=\"urn:ops\">/o:notif3/o:list2/o:l15</path>"
                     "<default-module>ops</default-module>"
                 "</inst-id>"
-            "</in>"
-        "</op-deps>"
-        "<op-deps>"
-            "<xpath xmlns:o=\"urn:ops\">/o:notif4</xpath>"
-        "</op-deps>"
+            "</deps>"
+        "</notification>"
+        "<notification>"
+            "<path xmlns:o=\"urn:ops\">/o:notif4</path>"
+        "</notification>"
     "</module>"
     );
 
@@ -434,19 +434,19 @@ test_inv_deps(void **state)
         "<name>ietf-routing</name>"
         "<revision>2015-04-17</revision>"
         "<removed/>"
-        "<data-deps>"
+        "<deps>"
             "<module>ietf-interfaces</module>"
-        "</data-deps>"
-        "<op-deps>"
-            "<xpath xmlns:rt=\"urn:ietf:params:xml:ns:yang:ietf-routing\">/rt:fib-route</xpath>"
+        "</deps>"
+        "<inverse-deps>ietf-interfaces</inverse-deps>"
+        "<rpc>"
+            "<path xmlns:rt=\"urn:ietf:params:xml:ns:yang:ietf-routing\">/rt:fib-route</path>"
             "<in>"
                 "<module>ietf-routing</module>"
             "</in>"
             "<out>"
                 "<module>ietf-routing</module>"
             "</out>"
-        "</op-deps>"
-        "<inverse-data-deps>ietf-interfaces</inverse-data-deps>"
+        "</rpc>"
     "</module>"
     );
 
@@ -455,10 +455,10 @@ test_inv_deps(void **state)
         "<name>ietf-interfaces</name>"
         "<revision>2014-05-08</revision>"
         "<removed/>"
-        "<data-deps>"
+        "<deps>"
             "<module>ietf-routing</module>"
-        "</data-deps>"
-        "<inverse-data-deps>ietf-routing</inverse-data-deps>"
+        "</deps>"
+        "<inverse-deps>ietf-routing</inverse-deps>"
     "</module>"
     );
 }
@@ -512,7 +512,7 @@ test_remove_dep_module(void **state)
     int ret;
     uint32_t conn_count;
 
-    /* install modules with one dependeing on the other */
+    /* install modules with one depending on the other */
     ret = sr_install_module(st->conn, TESTS_DIR "/files/ops-ref.yang", TESTS_DIR "/files", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_install_module(st->conn, TESTS_DIR "/files/ops.yang", TESTS_DIR "/files", NULL, 0);
@@ -555,6 +555,54 @@ test_remove_dep_module(void **state)
 
     /* cleanup */
     ret = sr_remove_module(st->conn, "ops");
+    assert_int_equal(ret, SR_ERR_OK);
+}
+
+static void
+test_remove_imp_module(void **state)
+{
+    struct state *st = (struct state *)*state;
+    int ret;
+    uint32_t conn_count;
+
+    /* install modules with one importing the other */
+    ret = sr_install_module(st->conn, TESTS_DIR "/files/simple.yang", TESTS_DIR "/files", NULL, 0);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_install_module(st->conn, TESTS_DIR "/files/simple-imp.yang", TESTS_DIR "/files", NULL, 0);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* apply scheduled changes */
+    sr_disconnect(st->conn);
+    st->conn = NULL;
+    ret = sr_connection_count(&conn_count);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(conn_count, 0);
+    ret = sr_connect(0, &st->conn);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* remove module imported by the other module */
+    ret = sr_remove_module(st->conn, "simple");
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* close connection so that changes are applied */
+    sr_disconnect(st->conn);
+    st->conn = NULL;
+    ret = sr_connection_count(&conn_count);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(conn_count, 0);
+
+    /* recreate connection, changes should be applied */
+    ret = sr_connect(0, &st->conn);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    cmp_int_data(st->conn, "simple-imp",
+    "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
+        "<name>simple-imp</name>"
+    "</module>"
+    );
+
+    /* cleanup */
+    ret = sr_remove_module(st->conn, "simple-imp");
     assert_int_equal(ret, SR_ERR_OK);
 }
 
@@ -614,9 +662,9 @@ test_update_module(void **state)
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>rev</name>"
         "<revision>1970-01-01</revision>"
-        "<op-deps>"
-            "<xpath xmlns:r=\"urn:rev\">/r:notif</xpath>"
-        "</op-deps>"
+        "<notification>"
+            "<path xmlns:r=\"urn:rev\">/r:notif</path>"
+        "</notification>"
     "</module>"
     );
 
@@ -663,17 +711,19 @@ test_change_feature(void **state)
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>features</name>"
         "<enabled-feature>feat1</enabled-feature>"
-        "<data-deps><module>test</module></data-deps>"
+        "<deps><module>test</module></deps>"
     "</module>"
     );
     cmp_int_data(st->conn, "test",
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>test</name>"
-        "<inverse-data-deps>features</inverse-data-deps>"
+        "<inverse-deps>features</inverse-deps>"
     "</module>"
     );
 
-    /* enable feat3, its if-feature is disabled */
+    /* enable feat2 and feat3 */
+    ret = sr_enable_module_feature(st->conn, "features", "feat2");
+    assert_int_equal(ret, SR_ERR_OK);
     ret = sr_enable_module_feature(st->conn, "features", "feat3");
     assert_int_equal(ret, SR_ERR_OK);
 
@@ -690,34 +740,9 @@ test_change_feature(void **state)
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>features</name>"
         "<enabled-feature>feat1</enabled-feature>"
-        "<changed-feature>"
-            "<name>feat3</name>"
-            "<change>enable</change>"
-        "</changed-feature>"
-        "<data-deps><module>test</module></data-deps>"
-    "</module>"
-    );
-
-    /* enable feat2, now all the features should be possible to enable */
-    ret = sr_enable_module_feature(st->conn, "features", "feat2");
-    assert_int_equal(ret, SR_ERR_OK);
-
-    /* apply scheduled changes */
-    sr_disconnect(st->conn);
-    st->conn = NULL;
-    ret = sr_connection_count(&conn_count);
-    assert_int_equal(ret, SR_ERR_OK);
-    assert_int_equal(conn_count, 0);
-    ret = sr_connect(0, &st->conn);
-    assert_int_equal(ret, SR_ERR_OK);
-
-    cmp_int_data(st->conn, "features",
-    "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
-        "<name>features</name>"
-        "<enabled-feature>feat1</enabled-feature>"
         "<enabled-feature>feat2</enabled-feature>"
         "<enabled-feature>feat3</enabled-feature>"
-        "<data-deps><module>test</module></data-deps>"
+        "<deps><module>test</module></deps>"
     "</module>"
     );
 
@@ -733,38 +758,12 @@ test_change_feature(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_set_item_str(sess, "/features:l3", "val3", NULL, 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(sess, 0, 0);
+    ret = sr_apply_changes(sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
-
-    /* disable feature, there are some dependent features enabled */
-    ret = sr_disable_module_feature(st->conn, "features", "feat1");
-    assert_int_equal(ret, SR_ERR_OK);
-
-    /* close connection (also frees session) so that changes are applied */
-    sr_disconnect(st->conn);
-    st->conn = NULL;
-    ret = sr_connection_count(&conn_count);
-    assert_int_equal(ret, SR_ERR_OK);
-    assert_int_equal(conn_count, 0);
-    ret = sr_connect(0, &st->conn);
-    assert_int_equal(ret, SR_ERR_OK);
-
-    /* still enabled */
-    cmp_int_data(st->conn, "features",
-    "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
-        "<name>features</name>"
-        "<enabled-feature>feat1</enabled-feature>"
-        "<enabled-feature>feat2</enabled-feature>"
-        "<enabled-feature>feat3</enabled-feature>"
-        "<changed-feature>"
-            "<name>feat1</name>"
-            "<change>disable</change>"
-        "</changed-feature>"
-        "<data-deps><module>test</module></data-deps>"
-    "</module>"
-    );
 
     /* disable all features */
+    ret = sr_disable_module_feature(st->conn, "features", "feat1");
+    assert_int_equal(ret, SR_ERR_OK);
     ret = sr_disable_module_feature(st->conn, "features", "feat2");
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_disable_module_feature(st->conn, "features", "feat3");
@@ -782,7 +781,7 @@ test_change_feature(void **state)
     ret = sr_session_start(st->conn, SR_DS_STARTUP, &sess);
     assert_int_equal(ret, SR_ERR_OK);
 
-    /* check that the feature was disabled and dependency removed */
+    /* check that the features were disabled and dependency removed */
     cmp_int_data(st->conn, "features",
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>features</name>"
@@ -809,9 +808,9 @@ test_change_feature(void **state)
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_delete_item(sess, "/features:l3", 0);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_apply_changes(sess, 0, 0);
+    ret = sr_apply_changes(sess, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
-    ret = sr_copy_config(sess, NULL, SR_DS_STARTUP, 0, 0);
+    ret = sr_copy_config(sess, NULL, SR_DS_STARTUP, 0, 1);
     assert_int_equal(ret, SR_ERR_OK);
     ret = sr_session_stop(sess);
 
@@ -972,16 +971,16 @@ test_foreign_aug(void **state)
     cmp_int_data(st->conn, "aug",
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>aug</name>"
-        "<inverse-data-deps>aug-trg</inverse-data-deps>"
+        "<inverse-deps>aug-trg</inverse-deps>"
     "</module>"
     );
 
     cmp_int_data(st->conn, "aug-trg",
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>aug-trg</name>"
-        "<data-deps>"
+        "<deps>"
             "<module>aug</module>"
-        "</data-deps>"
+        "</deps>"
     "</module>"
     );
 
@@ -1022,16 +1021,16 @@ test_foreign_aug(void **state)
     cmp_int_data(st->conn, "aug",
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>aug</name>"
-        "<inverse-data-deps>aug-trg</inverse-data-deps>"
+        "<inverse-deps>aug-trg</inverse-deps>"
     "</module>"
     );
 
     cmp_int_data(st->conn, "aug-trg",
     "<module xmlns=\"http://www.sysrepo.org/yang/sysrepo\">"
         "<name>aug-trg</name>"
-        "<data-deps>"
+        "<deps>"
             "<module>aug</module>"
-        "</data-deps>"
+        "</deps>"
     "</module>"
     );
 
@@ -1458,6 +1457,73 @@ test_get_module_info(void **state)
     assert_int_equal(ret, SR_ERR_OK);
 }
 
+static void
+test_feature_dependencies_across_modules(void **state)
+{
+    struct state *st = (struct state *)*state;
+    int ret;
+    uint32_t conn_count;
+
+    /* install modules */
+    ret = sr_install_module(st->conn, TESTS_DIR "/files/feature-deps.yang", TESTS_DIR "/files", NULL, 0);
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_install_module(st->conn, TESTS_DIR "/files/feature-deps2.yang", TESTS_DIR "/files", NULL, 0);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* apply scheduled changes */
+    sr_disconnect(st->conn);
+    st->conn = NULL;
+    ret = sr_connection_count(&conn_count);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(conn_count, 0);
+    ret = sr_connect(SR_CONN_ERR_ON_SCHED_FAIL, &st->conn);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* enable independent feature */
+    ret = sr_enable_module_feature(st->conn, "feature-deps2", "featx");
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* apply scheduled changes */
+    sr_disconnect(st->conn);
+    st->conn = NULL;
+    ret = sr_connection_count(&conn_count);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(conn_count, 0);
+    ret = sr_connect(SR_CONN_ERR_ON_SCHED_FAIL, &st->conn);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* enable dependent features */
+    ret = sr_enable_module_feature(st->conn, "feature-deps", "feat1");
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_enable_module_feature(st->conn, "feature-deps", "feat2");
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_enable_module_feature(st->conn, "feature-deps", "feat3");
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* apply scheduled changes */
+    sr_disconnect(st->conn);
+    st->conn = NULL;
+    ret = sr_connection_count(&conn_count);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(conn_count, 0);
+    ret = sr_connect(SR_CONN_ERR_ON_SCHED_FAIL, &st->conn);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    /* check if modules can be loaded again */
+    sr_disconnect(st->conn);
+    st->conn = NULL;
+    ret = sr_connection_count(&conn_count);
+    assert_int_equal(ret, SR_ERR_OK);
+    assert_int_equal(conn_count, 0);
+    ret = sr_connect(0, &st->conn);
+    assert_int_equal(ret, SR_ERR_OK);
+
+    ret = sr_remove_module(st->conn, "feature-deps");
+    assert_int_equal(ret, SR_ERR_OK);
+    ret = sr_remove_module(st->conn, "feature-deps2");
+    assert_int_equal(ret, SR_ERR_OK);
+}
+
 int
 main(void)
 {
@@ -1468,6 +1534,7 @@ main(void)
         cmocka_unit_test_setup_teardown(test_inv_deps, setup_f, teardown_f),
         cmocka_unit_test_setup_teardown(test_remove_module, setup_f, teardown_f),
         cmocka_unit_test_setup_teardown(test_remove_dep_module, setup_f, teardown_f),
+        cmocka_unit_test_setup_teardown(test_remove_imp_module, setup_f, teardown_f),
         cmocka_unit_test_setup_teardown(test_update_module, setup_f, teardown_f),
         cmocka_unit_test_setup_teardown(test_change_feature, setup_f, teardown_f),
         cmocka_unit_test_setup_teardown(test_replay_support, setup_f, teardown_f),
@@ -1477,6 +1544,7 @@ main(void)
         cmocka_unit_test_setup_teardown(test_set_module_access, setup_f, teardown_f),
         cmocka_unit_test_setup_teardown(test_get_module_access, setup_f, teardown_f),
         cmocka_unit_test_setup_teardown(test_get_module_info, setup_f, teardown_f),
+        cmocka_unit_test_setup_teardown(test_feature_dependencies_across_modules, setup_f, teardown_f),
     };
 
     setenv("CMOCKA_TEST_ABORT", "1", 1);
